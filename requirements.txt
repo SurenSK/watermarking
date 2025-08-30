@@ -1,0 +1,7 @@
+torch
+transformers
+scipy
+cryptography
+tqdm
+accelerate
+sentencepiece

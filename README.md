@@ -24,5 +24,11 @@ This library includes implementations of the following watermarking schemes:
 
 ***
 
+## Installation
 
+To get started, clone the repository and install the required dependencies.
 
+```bash
+git clone [https://github.com/SurenSK/watermarking.git](https://github.com/SurenSK/watermarking.git)
+cd watermarking
+pip install -r requirements.txt

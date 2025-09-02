@@ -126,59 +126,84 @@ class _OZ_DynamicEcc:
         else: return 0
 
 class OZ:
-    def __init__(self, key: int, payload: str = "", threshold: float = 2.0, t: float=1.0):
-        self.key, self.payload, self.threshold, self.t = key, payload, threshold, t
-        self.tokenIdx, self.ecc, self.code = 0, _OZ_DynamicEcc(), []
+    def __init__(self, key: int, rLambda: float, random_seed: int, payload: str = "", threshold: float = 2.0, t: float=1.0):
+        self.key, self.rLambda, self.random_seed = key, rLambda, random_seed
+        self.payload, self.threshold, self.t = payload, threshold, t
+        self.h, self.r, self.tokenIdx = 0.0, [], 0
+        self.ecc, self.code = _OZ_DynamicEcc(), []
         self.nextSymbol = self.ecc.getNextSymbol(self.payload, [])
         self.scores, self.scoreLen = torch.zeros(3, device=device), 0.0
-        # --- Simplified State ---
         self.key_bytes = key.to_bytes(8, 'big', signed=True)
-        # Salt can be a fixed byte string for this scheme
+        self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
         self.salt_bytes = b"OZ-WATERMARK-SALT"
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits/self.t, dim=-1); newTokenId = 0
         for bitIdx in range(bitLen):
             p1 = getP1(probs, newTokenId, bitIdx)
-            # Directly use getY with simplified state
-            yPrfVals = torch.tensor([
-                getY(self.salt_bytes, self.key_bytes, torch.tensor([self.tokenIdx, bitIdx, s])) 
-                for s in range(3)
-            ], device=device)
-            ySample = yPrfVals[self.nextSymbol]
-            nextBit = 1 if ySample < p1 else 0
-            self.scoreLen += 1.0
-            v = torch.where(torch.tensor(nextBit, device=device) == 1, yPrfVals, 1 - yPrfVals)
-            self.scores += -torch.log(v + 1e-9)
-            if self.scoreLen > 0:
-                normScores = (self.scores - self.scoreLen) / torch.sqrt(torch.tensor(self.scoreLen, device=device))
-                if (passed := torch.where(normScores > self.threshold)[0]).size(0) > 0:
-                    self.code.append(passed[0].item())
-                    self.scores.zero_(); self.scoreLen = 0.0
-                    self.nextSymbol = self.ecc.getNextSymbol(self.payload, self.code)
+            if self.h < self.rLambda:
+                context = torch.tensor([len(self.r)], dtype=torch.float64)
+                y = getY(self.seed_bytes, self.seed_bytes, context)
+                nextBit = 1 if y < p1 else 0
+                probChosen = p1 if nextBit == 1 else (1 - p1)
+                self.h += -math.log(probChosen + 1e-9)
+                self.r.append(nextBit)
+            else:
+                yPrfVals = torch.tensor([
+                    getY(self.salt_bytes, self.key_bytes, torch.tensor(self.r + [self.tokenIdx, bitIdx, s])) 
+                    for s in range(3)
+                ], device=device)
+                ySample = yPrfVals[self.nextSymbol]
+                nextBit = 1 if ySample < p1 else 0
+                self.scoreLen += 1.0
+                v = torch.where(torch.tensor(nextBit, device=device) == 1, yPrfVals, 1 - yPrfVals)
+                self.scores += -torch.log(v + 1e-9)
+                if self.scoreLen > 0:
+                    normScores = (self.scores - self.scoreLen) / torch.sqrt(torch.tensor(self.scoreLen, device=device))
+                    if (passed := torch.where(normScores > self.threshold)[0]).size(0) > 0:
+                        self.code.append(passed[0].item())
+                        self.scores.zero_(); self.scoreLen = 0.0
+                        self.nextSymbol = self.ecc.getNextSymbol(self.payload, self.code)
             newTokenId = (newTokenId << 1) + nextBit
         self.tokenIdx += 1
         return torch.tensor(newTokenId, dtype=torch.long, device=device)
     
     def decode(self, tokenIds: List[int]) -> str:
-        scores, scoreLen, retrieved = torch.zeros(3, device=device), 0.0, []
-        bitSeq = [int(b) for t in tokenIds for b in format(t, f'0{bitLen}b')]
-        for bitPos, bit in enumerate(bitSeq):
-            scoreLen += 1.0
-            tokenIdx, bitIdx = bitPos // bitLen, bitPos % bitLen
-            yPrfs = torch.tensor([
-                getY(self.salt_bytes, self.key_bytes, torch.tensor([tokenIdx, bitIdx, s])) 
-                for s in range(3)
-            ], device=device)
-            v = torch.where(torch.tensor(bit, device=device) == 1, yPrfs, 1 - yPrfs)
-            scores += -torch.log(v + 1e-9)
-            if scoreLen > 0:
-                normScores = (scores - scoreLen) / math.sqrt(scoreLen)
-                if (passed := torch.where(normScores > self.threshold)[0]).size(0) > 0:
-                    retrieved.append(passed[0].item())
-                    scores.zero_(); scoreLen = 0.0
-        return self.ecc.decode(retrieved)
-    
+        if not tokenIds: return ""
+        totalBits = len(tokenIds) * bitLen
+        fullBinary = [int(b) for t in tokenIds for b in format(t, f'0{bitLen}b')]
+        best_message = ""
+        # Assign tqdm to a variable to update its display
+        pbar = tqdm(range(totalBits + 1), desc="Sweeping OZ offsets")
+        for n_star in pbar:
+            rSeq = fullBinary[:n_star]
+            scores, scoreLen, retrieved = torch.zeros(3, device=device), 0.0, []
+            bitSeq = fullBinary[n_star:]
+            for bitPos, bit in enumerate(bitSeq):
+                scoreLen += 1.0
+                absBitPos = bitPos + n_star
+                tokenIdx, bitIdx = absBitPos // bitLen, absBitPos % bitLen
+                yPrfs = torch.tensor([
+                    getY(self.salt_bytes, self.key_bytes, torch.tensor(rSeq + [tokenIdx, bitIdx, s])) 
+                    for s in range(3)
+                ], device=device)
+                v = torch.where(torch.tensor(bit, device=device) == 1, yPrfs, 1 - yPrfs)
+                scores += -torch.log(v + 1e-9)
+                if scoreLen > 0:
+                    normScores = (scores - scoreLen) / math.sqrt(scoreLen)
+                    if (passed := torch.where(normScores > self.threshold)[0]).size(0) > 0:
+                        retrieved.append(passed[0].item())
+                        scores.zero_(); scoreLen = 0.0
+            decoded_message = self.ecc.decode(retrieved)
+            
+            if len(decoded_message) > len(best_message):
+                best_message = decoded_message
+                print(f"  -> New best message found at n*={n_star}: '{best_message}'")
+            
+            if best_message:
+                pbar.set_postfix_str(f"Best='{best_message}'")
+        return best_message
+
 def b2g(n: int) -> int: return n ^ (n >> 1)
 def g2b(n: int) -> int:
     mask = n >> 1
@@ -188,34 +213,44 @@ def g2b(n: int) -> int:
 blen = math.ceil(math.log2(len(tokenizer)))
 
 class DISC:
-    def __init__(self, key: int, random_seed: int, payloadBits: str = "", rLambda: float = 4.0, t: float=1.0):
+    def __init__(self, key: int, random_seed: int, payloadBits: str = "", rLambda: float = 4.0, t: float=1.0, contextChecking: bool = False):
         self.key, self.rLambda, self.t = key, rLambda, t
+        self.random_seed, self.contextChecking = random_seed, contextChecking
         self.h, self.r, self.tokenIdx = 0.0, [], 0
         self.payloadBits, self.msgLen = payloadBits, len(payloadBits)
         self.msgSpaceSz = 2**self.msgLen if self.msgLen > 0 else 1
         self.delta = 1.0 / self.msgSpaceSz
-        gMessage = b2g(int(payloadBits, 2) if payloadBits else 0)
-        self.deltaM = gMessage * self.delta
-        # --- Simplified State ---
+        self.deltaM = b2g(int(payloadBits, 2) if payloadBits else 0) * self.delta
         self.key_bytes = key.to_bytes(8, 'big', signed=True)
         self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
-        # Salt can be a fixed byte string
         self.salt_bytes = b"DISC-WATERMARK-SALT"
+        if self.contextChecking: self.seen_contexts = set()
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits/self.t, dim=-1); newTokenId = 0
         for bitIdx in range(bitLen):
             p1 = getP1(probs, newTokenId, bitIdx)
+            use_random_sampling = True
             if self.h < self.rLambda:
-                # Replace torch.rand with a deterministic KDF call
+                pass # Use random sampling
+            else:
+                context_tuple = tuple(self.r + [self.tokenIdx, bitIdx])
+                if self.contextChecking and context_tuple in self.seen_contexts:
+                    pass # Context repeated, use random sampling
+                else:
+                    if self.contextChecking: self.seen_contexts.add(context_tuple)
+                    use_random_sampling = False
+            
+            if use_random_sampling:
                 context = torch.tensor([len(self.r)], dtype=torch.float64)
                 y = getY(self.seed_bytes, self.seed_bytes, context)
                 nextBit = 1 if y < p1 else 0
-                probChosen = p1 if nextBit == 1 else (1 - p1)
-                self.h += -math.log(probChosen + 1e-9)
-                self.r.append(nextBit)
+                if self.h < self.rLambda:
+                    probChosen = p1 if nextBit == 1 else (1 - p1)
+                    self.h += -math.log(probChosen + 1e-9)
+                    self.r.append(nextBit)
             else:
-                context = torch.tensor(self.r + [self.tokenIdx, bitIdx], dtype=torch.float64)
+                context = torch.tensor(list(context_tuple), dtype=torch.float64)
                 y = getY(self.salt_bytes, self.key_bytes, context)
                 start, end = self.deltaM, self.deltaM + p1
                 nextBit = 1 if (start <= y < end if end <= 1.0 else y >= start or y < (end - 1.0)) else 0
@@ -223,20 +258,6 @@ class DISC:
         self.tokenIdx += 1
         return torch.tensor(newTokenId, dtype=torch.long, device=device)
     
-    def _getPValueForHyp(self, nStar: int, mPrime: int, fullBinarySequence: List[int], totalBits: int, msgLenHyp: int) -> tuple[float, float, dict]:
-        if not (0 <= mPrime < (2**msgLenHyp)): return 1.0, 0.0, {}
-        rSequenceHyp, deltaMPrime = fullBinarySequence[:nStar], mPrime * (1.0 / (2**msgLenHyp))
-        currentScore, bit_scores = 0.0, {}
-        for bitPos in range(nStar, totalBits):
-            tokenIdx, bitIdx = bitPos // blen, bitPos % blen
-            yPrf = self._getYPrf(rSequenceHyp, tokenIdx, bitIdx)
-            w = fullBinarySequence[bitPos]
-            score_component = self._calculateScore(w, yPrf, deltaMPrime)
-            currentScore += score_component; bit_scores[bitPos] = score_component
-        watermarkedLen = totalBits - nStar
-        if watermarkedLen <= 0: return 1.0, 0.0, {}
-        p_value = gammaincc(watermarkedLen, currentScore)
-        return p_value, currentScore, bit_scores
     def decode(self, tokenIds: List[int], msgLenHyp: int) -> Dict:
         if not tokenIds: return {'detected': False, 'message': ''}
         totalBits = len(tokenIds) * blen
@@ -246,17 +267,25 @@ class DISC:
         def _pvalue_for_hyp(nStar, mPrime):
             if not (0 <= mPrime < msgSpaceHyp): return 1.0, 0.0
             rSeq, deltaMPrime = fullBinarySequence[:nStar], mPrime * (1.0 / msgSpaceHyp)
-            currentScore = 0.0
+            currentScore, fresh_bit_count = 0.0, 0
+            if self.contextChecking: seen_contexts_hyp = set()
+            
             for bitPos in range(nStar, totalBits):
                 tokenIdx, bitIdx = bitPos // blen, bitPos % blen
-                context = torch.tensor(rSeq + [tokenIdx, bitIdx], dtype=torch.float64)
+                context_tuple = tuple(rSeq + [tokenIdx, bitIdx])
+                if self.contextChecking:
+                    if context_tuple in seen_contexts_hyp: continue
+                    seen_contexts_hyp.add(context_tuple)
+                
+                fresh_bit_count += 1
+                context = torch.tensor(list(context_tuple), dtype=torch.float64)
                 yPrf = getY(self.salt_bytes, self.key_bytes, context)
                 w = fullBinarySequence[bitPos]
                 v = (yPrf - deltaMPrime + 1.0) if w == 1 else (deltaMPrime - yPrf + 1.0)
                 currentScore += -math.log(v % 1.0 + 1e-9)
-            watermarkedLen = totalBits - nStar
-            if watermarkedLen <= 0: return 1.0, 0.0
-            return gammaincc(watermarkedLen, currentScore), currentScore
+
+            if fresh_bit_count <= 0: return 1.0, 0.0
+            return gammaincc(fresh_bit_count, currentScore), currentScore
 
         def _process_nstar(nStar):
             numCoarseSteps, coarseStepSize = 32, max(1, msgSpaceHyp // 32)
@@ -284,54 +313,57 @@ class DISC:
         return {'detected': detected, 'message': decodedBits, 'p_value': globalPValue, 'n_star': bestNStar}
 
 class DISCP2:
-    def __init__(self, key: int, watermarkMaskKey: int, random_seed: int, payloadBits: str = "", p2: float = 0.25, t: float = 1.0, windowSz: int = 8):
+    def __init__(self, key: int, watermarkMaskKey: int, random_seed: int, payloadBits: str = "", p2: float = 0.25, t: float = 1.0, windowSz: int = 8, contextChecking: bool = False):
         self.key, self.p2, self.windowSz, self.t = key, p2, windowSz, t
-        self.watermarkMaskKey = watermarkMaskKey
+        self.watermarkMaskKey, self.random_seed = watermarkMaskKey, random_seed
+        self.contextChecking = contextChecking
         self.token_history: List[int] = []; self.tokenIdx = 0
         self.payloadBits, self.msgLen = payloadBits, len(payloadBits)
-        self.msgSpaceSz = 2**self.msgLen if self.msgLen > 0 else 1
-        self.delta = 1.0 / self.msgSpaceSz
-        gMessage = b2g(int(payloadBits, 2) if payloadBits else 0)
-        self.deltaM = gMessage * self.delta
-        # --- Simplified State ---
+        self.delta = 1.0 / (2**self.msgLen if self.msgLen > 0 else 1)
+        self.deltaM = b2g(int(payloadBits, 2) if payloadBits else 0) * self.delta
         self.key_bytes = key.to_bytes(8, 'big', signed=True)
         self.mask_key_bytes = watermarkMaskKey.to_bytes(8, 'big', signed=True)
         self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
-        
-
-    def _getPrf(self, salt: bytes, ikm: bytes, history: List[int], tokenIdx: int, bitIdx: int) -> float:
-        context=torch.tensor(history + [tokenIdx, bitIdx], dtype=torch.float64)
-        return getY(salt, ikm, context)
-
-    def _get_padded_history(self) -> List[int]:
-        start_idx = max(0, self.tokenIdx - self.windowSz)
-        window = self.token_history[start_idx:self.tokenIdx]
-        return ([0] * (self.windowSz - len(window))) + window
+        if self.contextChecking: self.seen_contexts = set()
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits/self.t, dim=-1); newTokenId = 0
         padded_history = self._get_padded_history()
         for bitIdx in range(bitLen):
-            mask_prf = self._getPrf(self.mask_key_bytes, self.mask_key_bytes, padded_history, self.tokenIdx, bitIdx)
-            should_watermark = (mask_prf <= self.p2)
             p1 = getP1(probs, newTokenId, bitIdx)
-            if should_watermark:
+            context_tuple = tuple(padded_history + [self.tokenIdx, bitIdx])
+            
+            is_fresh = (not self.contextChecking) or (context_tuple not in self.seen_contexts)
+            mask_prf = self._getPrf(self.mask_key_bytes, self.mask_key_bytes, padded_history, self.tokenIdx, bitIdx)
+            
+            if is_fresh and (mask_prf <= self.p2):
+                if self.contextChecking: self.seen_contexts.add(context_tuple)
                 y = self._getPrf(self.key_bytes, self.key_bytes, padded_history, self.tokenIdx, bitIdx)
                 start, end = self.deltaM, self.deltaM + p1
                 nextBit = 1 if (start <= y < end if end <= 1.0 else (y >= start or y < (end - 1.0))) else 0
             else:
-                # Replace torch.rand with a deterministic KDF call
-                context = torch.tensor(padded_history + [self.tokenIdx, bitIdx], dtype=torch.float64)
+                if self.contextChecking and is_fresh: self.seen_contexts.add(context_tuple)
+                context = torch.tensor(list(context_tuple), dtype=torch.float64)
                 y = getY(self.seed_bytes, self.seed_bytes, context)
                 nextBit = 1 if y < p1 else 0
             newTokenId = (newTokenId << 1) + nextBit
         self.token_history.append(newTokenId); self.tokenIdx += 1
         return torch.tensor(newTokenId, dtype=torch.long, device=device)
+    # Add these methods inside the DISCP2 class
+    def _get_padded_history(self) -> List[int]:
+        start_idx = max(0, self.tokenIdx - self.windowSz)
+        window = self.token_history[start_idx:self.tokenIdx]
+        return ([0] * (self.windowSz - len(window))) + window
+
     @staticmethod
     def _get_padded_history_for_decode(full_history: List[int], current_token_idx: int, windowSz: int) -> List[int]:
         start_idx = max(0, current_token_idx - windowSz)
         window = full_history[start_idx:current_token_idx]
         return ([0] * (windowSz - len(window))) + window
+
+    def _getPrf(self, salt:bytes, ikm:bytes, history: List[int], tokenIdx: int, bitIdx: int) -> float:
+        context_tensor=torch.tensor(history + [tokenIdx, bitIdx], dtype=torch.float64)
+        return getY(salt, ikm, context_tensor)
 
     def _calculatePValue(self, mPrime: int, msgLenHyp: int, watermarked_bits: Dict[int, int], all_token_ids: List[int]) -> tuple[float, float]:
         if not (0 <= mPrime < (2**msgLenHyp)): return 1.0, 0.0
@@ -346,18 +378,26 @@ class DISCP2:
         watermarkedLen = len(watermarked_bits)
         if watermarkedLen > 0: return gammaincc(watermarkedLen, currentScore), currentScore
         else: return 1.0, 0.0
-
     def decode(self, tokenIds: List[int], msgLenHyp: int) -> Dict:
         if not tokenIds: return {'detected': False, 'message': ''}
         totalBits = len(tokenIds) * blen
         fullBinarySequence = [int(b) for t in tokenIds for b in format(t, f'0{blen}b')]
         watermarked_bits = {}
+        if self.contextChecking: seen_contexts = set()
+        
         for bitPos in range(totalBits):
             tokenIdx, bitIdx = bitPos // blen, bitPos % blen
             padded_history = self._get_padded_history_for_decode(tokenIds, tokenIdx, self.windowSz)
-            mask_prf = self._getPrf(self.mask_key_bytes, self.mask_key_bytes, padded_history, tokenIdx, bitIdx)
-            if mask_prf <= self.p2:
-                watermarked_bits[bitPos] = fullBinarySequence[bitPos]
+            context_tuple = tuple(padded_history + [tokenIdx, bitIdx])
+            
+            is_fresh = (not self.contextChecking) or (context_tuple not in seen_contexts)
+            if self.contextChecking: seen_contexts.add(context_tuple)
+
+            if is_fresh:
+                mask_prf = self._getPrf(self.mask_key_bytes, self.mask_key_bytes, padded_history, tokenIdx, bitIdx)
+                if mask_prf <= self.p2:
+                    watermarked_bits[bitPos] = fullBinarySequence[bitPos]
+        
         msgSpaceHyp = 2**msgLenHyp
         bestPValue, bestMStar = 1.0, 0
         
@@ -374,6 +414,7 @@ class DISCP2:
         detected = globalPValue < 1e-2
         decodedBits = format(g2b(bestMStar), f'0{msgLenHyp}b') if detected else ""
         return {'detected': detected, 'message': decodedBits, 'p_value': globalPValue}
+    
 @torch.no_grad()
 def generateSequence(prompt: str, algo: Callable, maxLen: int) -> List[int]:
     tokInput = tokenizer(prompt, return_tensors='pt').to(device)
@@ -419,14 +460,17 @@ def testChristMultiBit():
     return 1 if ok else 0
 
 def testOZ():
-    # No changes needed for testOZ as its __init__ signature was not changed
-    print("--- 2. OZ PAYLOAD WATERMARK TEST ---")
-    prompt,key,threshold,maxLen="The secret ingredient is",1337,3.0,150
+    print("--- 2. OZ PAYLOAD WATERMARK TEST (WITH ENTROPY GATHERING) ---")
+    prompt,key,rLambda,seed,threshold,maxLen="The secret ingredient is",1337,4.0,0,3.0,150
     payload=''.join(random.choice('01')for _ in range(5))
-    print(f"Embedding payload '{payload}'...")
-    ids=generateSequence(prompt,OZ(key=key,payload=payload,threshold=threshold),maxLen=maxLen)
+    print(f"Embedding payload '{payload}' with rLambda={rLambda}...")
+    # Note: The OZ constructor now requires rLambda and random_seed
+    oz_encoder = OZ(key=key, rLambda=rLambda, random_seed=seed, payload=payload, threshold=threshold)
+    ids=generateSequence(prompt, oz_encoder, maxLen=maxLen)
+    print(f'true n {len(oz_encoder.r)}')
     print("Decoding payload...")
-    retrieved=OZ(key=key,payload="",threshold=threshold).decode(ids)
+    oz_decoder = OZ(key=key, rLambda=rLambda, random_seed=seed, payload="", threshold=threshold)
+    retrieved = oz_decoder.decode(ids)
     ok=retrieved.startswith(payload)
     print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
     print(f"    Original:  '{payload}'\n    Retrieved: '{retrieved}'");print("-" * 45 + "\n")
@@ -474,6 +518,6 @@ def testDISCP2(payload=None):
 
 if __name__ == '__main__':
     # You can choose which tests to run
-    tests_to_run = [testDISC]
+    tests_to_run = [testOZ]
     success_count = sum(test() for test in tests_to_run)
     print(f"\n{'='*20}\nTest Passes: {success_count}/{len(tests_to_run)}\n{'='*20}")

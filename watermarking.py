@@ -13,6 +13,7 @@ from scipy.special import gammainc, gammaincc
 from tqdm import tqdm
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from collections import defaultdict
 
 print("Setting up model and tokenizer...")
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -28,6 +29,7 @@ print(f"Setup complete. Using device: {device}\n")
 def getEntropy(probs: torch.Tensor) -> float: return -torch.sum(probs * torch.log(probs + 1e-9)).item()
 def getEmpiricalEntropy(probs: torch.Tensor, selIdx: int) -> float: return -torch.log(probs[selIdx] + 1e-9).item()
 def getPDF(logits: torch.Tensor, t: float) -> torch.Tensor: return torch.softmax(logits/t, dim=-1)
+def getBinaryEntropy(p: float) -> float: return -(p * math.log2(p) + (1 - p) * math.log2(1 - p)) if 0<p<1 else 0.0
 
 def getP1(p:torch.Tensor,prefix:int,bitIdx:int)->float:
     v=p.shape[-1]; b=(v-1).bit_length()
@@ -46,69 +48,130 @@ def getY(salt: bytes, ikm: bytes, context: torch.Tensor) -> float:
     return seed / (2**64 - 1)
 
 class Christ:
-    def __init__(self, key: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None):
+    def __init__(self, key: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = False):
         self.key=key
         self.rLambda=rLambda
         self.random_seed=random_seed
         self.t=t
+        self.isGeneral=isGeneral
         self.payload_int=int(payload,2)if payload is not None else 0
         self.scoreThreshold=rLambda if scoreThreshold is None else scoreThreshold
         self.h,self.r,self.tokenIdx=0.0,[],0
+        self.in_entropy_phase=True
         self.key_bytes=key.to_bytes(8,'big',signed=True)
         self.seed_bytes=random_seed.to_bytes(8,'big',signed=True)
+        self.sampling_rng=torch.Generator(device=device)
+        self.sampling_rng.manual_seed(random_seed+1)
+        self.log=defaultdict(lambda:defaultdict(list))
+        self.log['params']={'key':key,'rLambda':rLambda,'random_seed':random_seed,'t':t,'payload':payload,'scoreThreshold':scoreThreshold,'isGeneral':isGeneral}
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
-        newTokenId=0
+        startTime=time.time()
         probs=torch.softmax(logits/self.t,dim=-1)
-        for bitIdx in range(bitLen):
-            p1=getP1(probs,newTokenId,bitIdx)
-            if self.h<self.rLambda:
-                context=torch.tensor([len(self.r)],dtype=torch.float64)
-                y=getY(self.seed_bytes,self.seed_bytes,context)
-                nextBit=1 if y<p1 else 0
-                probChosen=p1 if nextBit==1 else(1-p1)
-                self.h+=-math.log(probChosen+1e-9)
-                self.r.append(nextBit)
-            else:
-                context=torch.tensor(self.r+[self.tokenIdx,bitIdx,self.payload_int],dtype=torch.float64)
-                y=getY(self.key_bytes,self.key_bytes,context)
-                nextBit=1 if y<p1 else 0
-            newTokenId=(newTokenId<<1)+nextBit
+        newTokenId=0
+        self.log['encode']['vocab_entropy'].append(getEntropy(probs))
+        
+        if self.isGeneral:
+            generalFlag = self.h < self.rLambda
+            for bitIdx in range(bitLen):
+                p1=getP1(probs,newTokenId,bitIdx)
+                self.log['encode']['p1'].append(p1)
+                self.log['encode']['binary_entropy'].append(getBinaryEntropy(p1))
+                if generalFlag:
+                    context=torch.tensor([len(self.r)],dtype=torch.float64)
+                    y=getY(self.seed_bytes,self.seed_bytes,context)
+                    nextBit=1 if y<p1 else 0
+                    probChosen=p1 if nextBit==1 else(1-p1)
+                    score=-math.log(probChosen+1e-9)
+                    self.h+=score
+                    self.r.append(nextBit)
+                    self.log['encode']['y'].append(y)
+                    self.log['encode']['binary_empirical_entropy'].append(score)
+                else:
+                    context=torch.tensor(self.r+[self.tokenIdx,bitIdx,self.payload_int],dtype=torch.float64)
+                    y=getY(self.key_bytes,self.key_bytes,context)
+                    nextBit=1 if y<p1 else 0
+                    probChosen=p1 if nextBit==1 else(1-p1)
+                    self.log['encode']['y'].append(y)
+                    self.log['encode']['binary_empirical_entropy'].append(-math.log(probChosen+1e-9))
+                newTokenId=(newTokenId<<1)+nextBit
+        else:
+            for bitIdx in range(bitLen):
+                p1=getP1(probs,newTokenId,bitIdx)
+                self.log['encode']['p1'].append(p1)
+                self.log['encode']['binary_entropy'].append(getBinaryEntropy(p1))
+                if self.in_entropy_phase:
+                    context=torch.tensor([len(self.r)],dtype=torch.float64)
+                    y=getY(self.seed_bytes,self.seed_bytes,context)
+                    nextBit=1 if y<p1 else 0
+                    probChosen=p1 if nextBit==1 else(1-p1)
+                    score=-math.log(probChosen+1e-9)
+                    self.h+=score
+                    self.r.append(nextBit)
+                    self.log['encode']['y'].append(y)
+                    self.log['encode']['binary_empirical_entropy'].append(score)
+                    if self.h>=self.rLambda: self.in_entropy_phase=False
+                else:
+                    context=torch.tensor(self.r+[self.tokenIdx,bitIdx,self.payload_int],dtype=torch.float64)
+                    y=getY(self.key_bytes,self.key_bytes,context)
+                    nextBit=1 if y<p1 else 0
+                    probChosen=p1 if nextBit==1 else(1-p1)
+                    self.log['encode']['y'].append(y)
+                    self.log['encode']['binary_empirical_entropy'].append(-math.log(probChosen+1e-9))
+                newTokenId=(newTokenId<<1)+nextBit
+                
         self.tokenIdx+=1
+        self.log['encode']['vocab_empirical_entropy'].append(getEmpiricalEntropy(probs,newTokenId))
+        self.log['encode']['time'].append(time.time()-startTime)
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
     def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:
+        startTime=time.time()
         if not tokenIds: return {'detected': False, 'score': -math.inf, 'n_star': 0, 'message': ''}
-        totalBits=len(tokenIds)*bitLen
         fullBinary=[int(b) for t in tokenIds for b in format(t,f'0{bitLen}b')]
-
-        def _score_for_nstar(nStar,hyp):
-            currentScore,rSeq=0.0,fullBinary[:nStar]
-            for bitPos in range(nStar,totalBits):
-                tokenIdx,bitIdx=bitPos//bitLen,bitPos%bitLen
-                context=torch.tensor(rSeq+[tokenIdx,bitIdx,hyp],dtype=torch.float64)
-                yPrf=getY(self.key_bytes,self.key_bytes,context)
-                obsBit=fullBinary[bitPos]
-                v=yPrf if obsBit==1 else(1-yPrf)
-                currentScore+=-math.log(v+1e-9)
-            wmLen=totalBits-nStar
-            normScore=(currentScore-wmLen)/math.sqrt(wmLen)if wmLen>0 else 0.0
-            return normScore,nStar
-
+        totalBits=len(fullBinary)
+        n_star_step=bitLen if self.isGeneral else 1
+        search_range=range(0,totalBits+1,n_star_step)
+        num_offsets=len(search_range)
         num_messages=2**payloadLen if payloadLen is not None and payloadLen>0 else 1
+        
+        y_tensor=torch.zeros((totalBits,num_messages,num_offsets))
+        scores_tensor=torch.zeros((totalBits,num_messages,num_offsets))
+        norm_scores_matrix=torch.full((num_messages,num_offsets),-math.inf)
+        
         best_overall_score,best_message_int,best_n_star=-math.inf,-1,0
-        for payload_hyp_int in range(num_messages):
-            for n in range(totalBits+1):
-                normScore,nStar=_score_for_nstar(n,payload_hyp_int)
+        
+        for p_idx,payload_hyp_int in enumerate(range(num_messages)):
+            for o_idx,offset in enumerate(tqdm(search_range, desc=f"Sweeping n* for payload {payload_hyp_int}", leave=False)):
+                currentScore,rSeq=0.0,fullBinary[:offset]
+                for bitPos in range(offset,totalBits):
+                    tokenIdx,bitIdx=bitPos//bitLen,bitPos%bitLen
+                    context=torch.tensor(rSeq+[tokenIdx,bitIdx,payload_hyp_int],dtype=torch.float64)
+                    yPrf=getY(self.key_bytes,self.key_bytes,context)
+                    obsBit=fullBinary[bitPos]
+                    v=yPrf if obsBit==1 else(1-yPrf)
+                    bit_score=-math.log(v+1e-9)
+                    currentScore+=bit_score
+                    y_tensor[bitPos,p_idx,o_idx]=yPrf
+                    scores_tensor[bitPos,p_idx,o_idx]=bit_score
+                
+                wmLen=totalBits-offset
+                normScore=(currentScore-wmLen)/math.sqrt(wmLen)if wmLen>0 else 0.0
+                norm_scores_matrix[p_idx,o_idx]=normScore
+                
                 if normScore>best_overall_score:
-                    best_overall_score,best_message_int,best_n_star=normScore,payload_hyp_int,nStar
+                    best_overall_score,best_message_int,best_n_star=normScore,payload_hyp_int,offset
         
         detected=best_overall_score>self.scoreThreshold
         message=""
         if detected and payloadLen is not None and payloadLen>0:
             message=format(best_message_int,f'0{payloadLen}b')
+            
+        self.log['decode']['time']=time.time()-startTime
+        self.log['decode']['y_tensor']=y_tensor
+        self.log['decode']['scores_tensor']=scores_tensor
+        self.log['decode']['norm_scores_matrix']=norm_scores_matrix
         return {'detected': detected, 'score': best_overall_score, 'n_star': best_n_star, 'message': message}
-    
 
 class _OZ_DynamicEcc:
     def decode(self, y: List[int]) -> str:
@@ -136,6 +199,7 @@ class OZ:
         self.key_bytes = key.to_bytes(8, 'big', signed=True)
         self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
         self.salt_bytes = b"OZ-WATERMARK-SALT"
+        self.log = defaultdict(List)
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits/self.t, dim=-1); newTokenId = 0
@@ -225,6 +289,7 @@ class DISC:
         self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
         self.salt_bytes = b"DISC-WATERMARK-SALT"
         if self.contextChecking: self.seen_contexts = set()
+        self.log = defaultdict(List)
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits/self.t, dim=-1); newTokenId = 0
@@ -325,6 +390,7 @@ class DISCP2:
         self.mask_key_bytes = watermarkMaskKey.to_bytes(8, 'big', signed=True)
         self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
         if self.contextChecking: self.seen_contexts = set()
+        self.log = defaultdict(List)
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits/self.t, dim=-1); newTokenId = 0
@@ -429,6 +495,7 @@ def generateSequence(prompt: str, algo: Callable, maxLen: int) -> List[int]:
         lastToken = newToken.unsqueeze(0)
     return inputIds.squeeze(0)[initLen:].tolist()
 
+
 def testChrist():
     print("--- 1. CHRIST DETECTION WATERMARK TEST ---")
     prompt, key, rLambda, maxLen, seed = "Artificial intelligence is", 42, 4.0, 40, 0
@@ -444,20 +511,6 @@ def testChrist():
     print(f"Normal text       -> {'NOT DETECTED' if normOk else 'DETECTED'} (Score: {normRes['score']:.2f})")
     print("\nResult: SUCCESS" if ok and normOk else "\nResult: FAILED");print("-" * 45 + "\n")
     return 1 if(ok and normOk)else 0
-
-def testChristMultiBit():
-    print("--- 1b. CHRIST MULTI-BIT PAYLOAD TEST ---")
-    prompt,payload,key,rLambda,maxLen,seed="The secret launch code is","10",1984,4.0,50,0
-    print(f"Embedding payload '{payload}'...")
-    ids=generateSequence(prompt,Christ(key=key,rLambda=rLambda,payload=payload,random_seed=seed),maxLen=maxLen)
-    print("Decoding payload from generated text...")
-    res=Christ(key=key,rLambda=rLambda,random_seed=seed).decode(ids,payloadLen=len(payload))
-    retrieved=res['message']
-    ok=res['detected']and(retrieved==payload)
-    print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
-    print(f"  Detection Status:  {res['detected']}\n  Original Payload:    '{payload}'\n  Retrieved Payload:   '{retrieved}'")
-    print(f"  (Score: {res['score']:.2f}, n*={res['n_star']})");print("-" * 45 + "\n")
-    return 1 if ok else 0
 
 def testOZ():
     print("--- 2. OZ PAYLOAD WATERMARK TEST (WITH ENTROPY GATHERING) ---")
@@ -475,6 +528,25 @@ def testOZ():
     print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
     print(f"    Original:  '{payload}'\n    Retrieved: '{retrieved}'");print("-" * 45 + "\n")
     return 1 if ok else 0
+
+def testChristGeneral():
+    print("--- 1c. CHRIST-GENERAL MULTI-BIT PAYLOAD TEST ---")
+    prompt,payload,key,rLambda,maxLen,seed="The future of AI is",''.join(random.choice('01')for _ in range(2)),2077,5.0,60,42
+    print(f"Embedding payload '{payload}' using binarized method...")
+    # Use the new ChristGeneral class
+    cg_encoder = Christ(key=key, rLambda=rLambda, payload=payload, random_seed=seed,isGeneral=True)
+    ids = generateSequence(prompt, cg_encoder, maxLen=maxLen)
+    print(f" -> Encoder finished with h={cg_encoder.h:.2f} after {len(cg_encoder.r)} prefix bits.")
+    print("Decoding payload from generated text...")
+    cg_decoder = Christ(key=key, rLambda=rLambda, random_seed=seed,isGeneral=True)
+    res = cg_decoder.decode(ids, payloadLen=len(payload))
+    retrieved = res['message']
+    ok = res['detected'] and (retrieved == payload)
+    print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
+    print(f"  Detection Status:  {res['detected']}\n  Original Payload:    '{payload}'\n  Retrieved Payload:   '{retrieved}'")
+    print(f"  (Best Score: {res['score']:.2f}, n*={res['n_star']} bits)");print("-" * 45 + "\n")
+    return 1 if ok else 0
+
 
 def testDISC():
     print("--- 3. DISC PAYLOAD WATERMARK TEST ---")
@@ -517,7 +589,6 @@ def testDISCP2(payload=None):
     return 1 if ok else 0
 
 if __name__ == '__main__':
-    # You can choose which tests to run
-    tests_to_run = [testOZ]
+    tests_to_run = [testChrist, testChristGeneral]*5
     success_count = sum(test() for test in tests_to_run)
     print(f"\n{'='*20}\nTest Passes: {success_count}/{len(tests_to_run)}\n{'='*20}")

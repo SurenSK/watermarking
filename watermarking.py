@@ -568,37 +568,55 @@ def generateSequence(prompt: str, algo: Callable, maxLen: int) -> List[int]:
 
 def testChrist():
     print("--- 1. CHRIST DETECTION WATERMARK TEST ---")
-    prompt, key, rLambda, maxLen, seed = "Artificial intelligence is", 42, 4.0, 40, 0
+    prompt,key,rLambda,maxLen,seed="Artificial intelligence is",42,4.0,40,0
     print(f"Generating watermarked text (RLambda = {rLambda})...")
-    wmIds=generateSequence(prompt,Christ(salt=key,key=key,rLambda=rLambda,random_seed=seed),maxLen=maxLen)
+    wm_encoder=Christ(salt=key,key=key,rLambda=rLambda,random_seed=seed)
+    wmIds=generateSequence(prompt,wm_encoder,maxLen=maxLen)
     print(f"Generating normal text (RLambda = infinity)...")
-    normIds=generateSequence(prompt,Christ(salt=key,key=key,rLambda=float('inf'),random_seed=seed),maxLen=maxLen)
+    norm_encoder=Christ(salt=key,key=key,rLambda=float('inf'),random_seed=seed)
+    normIds=generateSequence(prompt,norm_encoder,maxLen=maxLen)
     print("\nRunning detection...")
     det=Christ(salt=key,key=key,rLambda=rLambda,random_seed=seed)
     wmRes,normRes=det.decode(wmIds),det.decode(normIds)
-    ok,normOk=wmRes['detected'],not normRes['detected']
+    n_star_ok=wmRes['n_star']==len(wm_encoder.r)
+    encoder_y=torch.tensor(wm_encoder.log['encode']['y'][wmRes['n_star']:])
+    decoder_y=det.log['decode']['y_tensor'][wmRes['n_star']:,0,wmRes['n_star']]
+    y_vals_ok=torch.allclose(encoder_y,decoder_y)if len(encoder_y)>0 else True
+    ok,normOk=wmRes['detected']and n_star_ok and y_vals_ok,not normRes['detected']
     print(f"Watermarked text  -> {'DETECTED' if ok else 'NOT DETECTED'} (Score: {wmRes['score']:.2f})")
+    print(f"  n* match: {'✅' if n_star_ok else '❌'} (Expected: {len(wm_encoder.r)}, Got: {wmRes['n_star']})")
+    print(f"  Y-vals match: {'✅' if y_vals_ok else '❌'}")
     print(f"Normal text       -> {'NOT DETECTED' if normOk else 'DETECTED'} (Score: {normRes['score']:.2f})")
-    print("\nResult: SUCCESS" if ok and normOk else "\nResult: FAILED");print("-" * 45 + "\n")
+    print("\nResult: SUCCESS" if ok and normOk else "\nResult: FAILED")
+    print("-" * 45 + "\n")
     return 1 if(ok and normOk)else 0
-
 
 def testChristGeneral():
     print("--- 1c. CHRIST-GENERAL MULTI-BIT PAYLOAD TEST ---")
     prompt,payload,key,rLambda,maxLen,seed="The future of AI is",''.join(random.choice('01')for _ in range(2)),2077,5.0,60,42
     print(f"Embedding payload '{payload}' using binarized method...")
-    # Use the new ChristGeneral class
-    cg_encoder = Christ(key=key, salt=key, rLambda=rLambda, payload=payload, random_seed=seed,isGeneral=True)
-    ids = generateSequence(prompt, cg_encoder, maxLen=maxLen)
+    cg_encoder=Christ(key=key,salt=key,rLambda=rLambda,payload=payload,random_seed=seed,isGeneral=True)
+    ids=generateSequence(prompt,cg_encoder,maxLen=maxLen)
     print(f" -> Encoder finished with h={cg_encoder.h:.2f} after {len(cg_encoder.r)} prefix bits.")
     print("Decoding payload from generated text...")
-    cg_decoder = Christ(key=key, salt=key, rLambda=rLambda, random_seed=seed,isGeneral=True)
-    res = cg_decoder.decode(ids, payloadLen=len(payload))
-    retrieved = res['message']
-    ok = res['detected'] and (retrieved == payload)
+    cg_decoder=Christ(key=key,salt=key,rLambda=rLambda,random_seed=seed,isGeneral=True)
+    res=cg_decoder.decode(ids,payloadLen=len(payload))
+    retrieved,p_idx=res['message'],int(payload,2)
+    n_star_ok=res['n_star']==len(cg_encoder.r)
+    o_idx=res['n_star']//bitLen
+    encoder_y=torch.tensor(cg_encoder.log['encode']['y'][res['n_star']:])
+    decoder_y=cg_decoder.log['decode']['y_tensor'][res['n_star']:,p_idx,o_idx]
+    y_vals_ok=torch.allclose(encoder_y,decoder_y)if len(encoder_y)>0 else True
+    ok=res['detected']and(retrieved==payload)and n_star_ok and y_vals_ok
     print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
-    print(f"  Detection Status:  {res['detected']}\n  Original Payload:    '{payload}'\n  Retrieved Payload:   '{retrieved}'")
-    print(f"  (Best Score: {res['score']:.2f}, n*={res['n_star']} bits)");print("-" * 45 + "\n")
+    print(f"  Detection Status:    {res['detected']}")
+    print(f"  Payload Match:       {'✅' if retrieved == payload else '❌'}")
+    print(f"    Original:          '{payload}'")
+    print(f"    Retrieved:         '{retrieved}'")
+    print(f"  n* Match:            {'✅' if n_star_ok else '❌'} (Expected: {len(cg_encoder.r)}, Got: {res['n_star']})")
+    print(f"  Y-values Match:      {'✅' if y_vals_ok else '❌'}")
+    print(f"  (Best Score: {res['score']:.2f})")
+    print("-" * 45 + "\n")
     return 1 if ok else 0
 
 def testOZ():

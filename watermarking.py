@@ -52,7 +52,7 @@ class Christ:
     by Christ et al. (2023). This method embeds a watermark by pseudorandomly selecting
     token bits during generation, conditioned on a secret key.
     """
-    def __init__(self, key: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = False):
+    def __init__(self, key: int, salt: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = False):
         """
         Initializes the watermarking processor.
 
@@ -80,6 +80,7 @@ class Christ:
 
         # Pre-compute byte representations of keys/seeds for the PRF
         self.key_bytes=key.to_bytes(8,'big',signed=True)
+        self.salt_bytes=salt.to_bytes(8,'big',signed=True)
         self.seed_bytes=random_seed.to_bytes(8,'big',signed=True)
         
         # Separate RNG for any stochastic sampling (not used in this deterministic implementation)
@@ -128,7 +129,7 @@ class Christ:
                 else:
                     # Watermarking Phase for this token: Use secret key.
                     context=torch.tensor(self.r+[self.tokenIdx,bitIdx,self.payload_int],dtype=torch.float64)
-                    y=getY(self.key_bytes,self.key_bytes,context)
+                    y=getY(self.salt_bytes,self.key_bytes,context)
                     nextBit=1 if y<p1 else 0
                     probChosen=p1 if nextBit==1 else(1-p1)
                     self.log['encode']['y'].append(y)
@@ -155,7 +156,7 @@ class Christ:
                 else:
                     # Watermarking Phase: Use secret key.
                     context=torch.tensor(self.r+[self.tokenIdx,bitIdx,self.payload_int],dtype=torch.float64)
-                    y=getY(self.key_bytes,self.key_bytes,context)
+                    y=getY(self.salt_bytes,self.key_bytes,context)
                     nextBit=1 if y<p1 else 0
                     probChosen=p1 if nextBit==1 else(1-p1)
                     self.log['encode']['y'].append(y)
@@ -167,7 +168,7 @@ class Christ:
         self.log['encode']['time'].append(time.time()-startTime)
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
-    def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:
+    def decode(self, salt:int, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:
         """
         Detects the watermark in a sequence of token IDs.
 
@@ -213,7 +214,7 @@ class Christ:
                     
                     # Reconstruct the PRF context for this bit position
                     context=torch.tensor(rSeq+[tokenIdx,bitIdx,payload_hyp_int],dtype=torch.float64)
-                    yPrf=getY(self.key_bytes,self.key_bytes,context) # Re-generate the PRF value
+                    yPrf=getY(self.salt_bytes,self.key_bytes,context) # Re-generate the PRF value
                     
                     obsBit=fullBinary[bitPos]
                     v=yPrf if obsBit==1 else(1-yPrf) # Probability of observing this bit under the watermark hypothesis

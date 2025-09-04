@@ -48,7 +48,7 @@ def getY(salt: bytes, ikm: bytes, context: torch.Tensor) -> float:
 
 class Christ:
     """
-    Implements the watermarking algorithm from "Provably Statistical Watermarking for LLMs"
+    Implements the watermarking algorithm from "Undetectable Watermarks for Language Models"
     by Christ et al. (2023). This method embeds a watermark by pseudorandomly selecting
     token bits during generation, conditioned on a secret key.
     """

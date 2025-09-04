@@ -41,7 +41,7 @@ def getP1(p:torch.Tensor,prefix:int,bitIdx:int)->float:
     return((s2-s1)/total).item()
 
 def getY(salt: bytes, ikm: bytes, context: torch.Tensor) -> float:
-    info = context.cpu().numpy().tobytes()
+    info = context.cpu().numpy().tobytes() if context is not None else None
     hkdf = HKDF(algorithm=hashes.SHA256(), length=8, salt=salt, info=info)
     seed = int.from_bytes(hkdf.derive(ikm), 'big')
     return seed / (2**64 - 1)
@@ -117,8 +117,7 @@ class Christ:
                 self.log['encode']['binary_entropy'].append(getBinaryEntropy(p1))
                 if generalFlag:
                     # Entropy Accumulation Phase for this token: Use public seed.
-                    context=torch.tensor([len(self.r)],dtype=torch.float64)
-                    y=getY(self.seed_bytes,self.seed_bytes,context)
+                    y=getY(len(self.r).to_bytes(8,'big',signed=True),self.seed_bytes,None)
                     nextBit=1 if y<p1 else 0
                     probChosen=p1 if nextBit==1 else(1-p1)
                     score=-math.log(probChosen+1e-9)
@@ -143,8 +142,7 @@ class Christ:
                 self.log['encode']['binary_entropy'].append(getBinaryEntropy(p1))
                 if self.in_entropy_phase:
                     # Entropy Accumulation Phase: Use public seed.
-                    context=torch.tensor([len(self.r)],dtype=torch.float64)
-                    y=getY(self.seed_bytes,self.seed_bytes,context)
+                    y=getY(len(self.r).to_bytes(8,'big',signed=True),self.seed_bytes,None)
                     nextBit=1 if y<p1 else 0
                     probChosen=p1 if nextBit==1 else(1-p1)
                     score=-math.log(probChosen+1e-9)
@@ -162,13 +160,13 @@ class Christ:
                     self.log['encode']['y'].append(y)
                     self.log['encode']['binary_empirical_entropy'].append(-math.log(probChosen+1e-9))
                 newTokenId=(newTokenId<<1)+nextBit
-                
+        
         self.tokenIdx+=1
         self.log['encode']['vocab_empirical_entropy'].append(getEmpiricalEntropy(probs,newTokenId))
         self.log['encode']['time'].append(time.time()-startTime)
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
-    def decode(self, salt:int, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:
+    def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:
         """
         Detects the watermark in a sequence of token IDs.
 
@@ -502,7 +500,7 @@ class DISCP2:
     def _getPrf(self, salt:bytes, ikm:bytes, history: List[int], tokenIdx: int, bitIdx: int) -> float:
         context_tensor=torch.tensor(history + [tokenIdx, bitIdx], dtype=torch.float64)
         return getY(salt, ikm, context_tensor)
-
+    
     def _calculatePValue(self, mPrime: int, msgLenHyp: int, watermarked_bits: Dict[int, int], all_token_ids: List[int]) -> tuple[float, float]:
         if not (0 <= mPrime < (2**msgLenHyp)): return 1.0, 0.0
         deltaMPrime = mPrime * (1.0 / (2**msgLenHyp))
@@ -572,17 +570,36 @@ def testChrist():
     print("--- 1. CHRIST DETECTION WATERMARK TEST ---")
     prompt, key, rLambda, maxLen, seed = "Artificial intelligence is", 42, 4.0, 40, 0
     print(f"Generating watermarked text (RLambda = {rLambda})...")
-    wmIds=generateSequence(prompt,Christ(key=key,rLambda=rLambda,random_seed=seed),maxLen=maxLen)
+    wmIds=generateSequence(prompt,Christ(salt=key,key=key,rLambda=rLambda,random_seed=seed),maxLen=maxLen)
     print(f"Generating normal text (RLambda = infinity)...")
-    normIds=generateSequence(prompt,Christ(key=key,rLambda=float('inf'),random_seed=seed),maxLen=maxLen)
+    normIds=generateSequence(prompt,Christ(salt=key,key=key,rLambda=float('inf'),random_seed=seed),maxLen=maxLen)
     print("\nRunning detection...")
-    det=Christ(key=key,rLambda=rLambda,random_seed=seed)
+    det=Christ(salt=key,key=key,rLambda=rLambda,random_seed=seed)
     wmRes,normRes=det.decode(wmIds),det.decode(normIds)
     ok,normOk=wmRes['detected'],not normRes['detected']
     print(f"Watermarked text  -> {'DETECTED' if ok else 'NOT DETECTED'} (Score: {wmRes['score']:.2f})")
     print(f"Normal text       -> {'NOT DETECTED' if normOk else 'DETECTED'} (Score: {normRes['score']:.2f})")
     print("\nResult: SUCCESS" if ok and normOk else "\nResult: FAILED");print("-" * 45 + "\n")
     return 1 if(ok and normOk)else 0
+
+
+def testChristGeneral():
+    print("--- 1c. CHRIST-GENERAL MULTI-BIT PAYLOAD TEST ---")
+    prompt,payload,key,rLambda,maxLen,seed="The future of AI is",''.join(random.choice('01')for _ in range(2)),2077,5.0,60,42
+    print(f"Embedding payload '{payload}' using binarized method...")
+    # Use the new ChristGeneral class
+    cg_encoder = Christ(key=key, salt=key, rLambda=rLambda, payload=payload, random_seed=seed,isGeneral=True)
+    ids = generateSequence(prompt, cg_encoder, maxLen=maxLen)
+    print(f" -> Encoder finished with h={cg_encoder.h:.2f} after {len(cg_encoder.r)} prefix bits.")
+    print("Decoding payload from generated text...")
+    cg_decoder = Christ(key=key, salt=key, rLambda=rLambda, random_seed=seed,isGeneral=True)
+    res = cg_decoder.decode(ids, payloadLen=len(payload))
+    retrieved = res['message']
+    ok = res['detected'] and (retrieved == payload)
+    print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
+    print(f"  Detection Status:  {res['detected']}\n  Original Payload:    '{payload}'\n  Retrieved Payload:   '{retrieved}'")
+    print(f"  (Best Score: {res['score']:.2f}, n*={res['n_star']} bits)");print("-" * 45 + "\n")
+    return 1 if ok else 0
 
 def testOZ():
     print("--- 2. OZ PAYLOAD WATERMARK TEST (WITH ENTROPY GATHERING) ---")
@@ -600,25 +617,6 @@ def testOZ():
     print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
     print(f"    Original:  '{payload}'\n    Retrieved: '{retrieved}'");print("-" * 45 + "\n")
     return 1 if ok else 0
-
-def testChristGeneral():
-    print("--- 1c. CHRIST-GENERAL MULTI-BIT PAYLOAD TEST ---")
-    prompt,payload,key,rLambda,maxLen,seed="The future of AI is",''.join(random.choice('01')for _ in range(2)),2077,5.0,60,42
-    print(f"Embedding payload '{payload}' using binarized method...")
-    # Use the new ChristGeneral class
-    cg_encoder = Christ(key=key, rLambda=rLambda, payload=payload, random_seed=seed,isGeneral=True)
-    ids = generateSequence(prompt, cg_encoder, maxLen=maxLen)
-    print(f" -> Encoder finished with h={cg_encoder.h:.2f} after {len(cg_encoder.r)} prefix bits.")
-    print("Decoding payload from generated text...")
-    cg_decoder = Christ(key=key, rLambda=rLambda, random_seed=seed,isGeneral=True)
-    res = cg_decoder.decode(ids, payloadLen=len(payload))
-    retrieved = res['message']
-    ok = res['detected'] and (retrieved == payload)
-    print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
-    print(f"  Detection Status:  {res['detected']}\n  Original Payload:    '{payload}'\n  Retrieved Payload:   '{retrieved}'")
-    print(f"  (Best Score: {res['score']:.2f}, n*={res['n_star']} bits)");print("-" * 45 + "\n")
-    return 1 if ok else 0
-
 
 def testDISC():
     print("--- 3. DISC PAYLOAD WATERMARK TEST ---")

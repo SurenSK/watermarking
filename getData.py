@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import cProfile, pstats
 import hmac, hashlib
+import msgpack
 
 N_PROMPTS = 2
 MAX_NEW_TOKENS = 50
@@ -57,14 +58,8 @@ def getP1(p:torch.Tensor,prefix:int,bitIdx:int)->float:
     if(total:=s2-s0)<1e-9: return 0.0
     return((s2-s1)/total).item()
 
-# def getY(salt: bytes, ikm: bytes, context: List[Any]) -> float:
-#     info=json.dumps(context,sort_keys=True,separators=(',',':')).encode('utf-8') if context is not None else None
-#     hkdf=HKDF(algorithm=hashes.SHA256(),length=8,salt=salt,info=info)
-#     seed=int.from_bytes(hkdf.derive(ikm),'big')
-#     return seed/(2**64-1)
-
 def getY(salt: bytes, ikm: bytes, context: List[Any]) -> float:
-    info = json.dumps(context, sort_keys=True, separators=(',', ':')).encode('utf-8') if context is not None else b""
+    info = msgpack.packb(context, use_bin_type=True) if context else b""
     msg = len(salt).to_bytes(4, 'big') + salt + len(info).to_bytes(4, 'big') + info
     digest = hmac.new(ikm, msg, hashlib.sha256).digest()
     seed = int.from_bytes(digest[:8], 'big')

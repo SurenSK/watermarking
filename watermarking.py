@@ -565,7 +565,6 @@ def generateSequence(prompt: str, algo: Callable, maxLen: int) -> List[int]:
         lastToken = newToken.unsqueeze(0)
     return inputIds.squeeze(0)[initLen:].tolist()
 
-
 def testChrist():
     print("--- 1. CHRIST DETECTION WATERMARK TEST ---")
     prompt,key,rLambda,maxLen,seed="Artificial intelligence is",42,4.0,40,0

@@ -1,3 +1,6 @@
 scratch*
 /.venv
 algos.py
+_*
+.env
+output*

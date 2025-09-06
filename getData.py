@@ -113,7 +113,7 @@ class Christ:
             p1=getP1(cs,newTokenId,bitIdx)
             newTokenId = (newTokenId<<1) | Ys[bitIdx]<p1
             self.h += getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1)
-            if self.isGeneral and self.h>self.rLambda: # sometimes invalidate self.inH at bit boundary if isGeneral status, update Ys
+            if self.isGeneral and self.h>=self.rLambda: # sometimes invalidate self.inH at bit boundary if isGeneral status, update Ys
                 self.inH = False
                 Ys = getYs(self.salt_bytes, self.key_bytes, [self.r, self.tkIdx], bitLen)
         self.tkIdx += 1

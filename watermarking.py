@@ -369,7 +369,7 @@ class DISC:
             if self.h < self.rLambda:
                 pass # Use random sampling
             else:
-                context_tuple = tuple(self.r + [self.tokenIdx, bitIdx])
+                context_tuple = tuple(self.r + [self.tokenIdx, bitIdx]) # TODO replace token idx with last h tokens
                 if self.contextChecking and context_tuple in self.seen_contexts:
                     pass # Context repeated, use random sampling
                 else:

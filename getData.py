@@ -14,7 +14,7 @@ import hmac, hashlib
 import msgpack
 
 N_PROMPTS = 2
-MAX_NEW_TOKENS = 50
+MAX_NEW_TOKENS = 500
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 DATASET_ID = "allenai/c4"
 DATASET_CONFIG = "en.noblocklist"

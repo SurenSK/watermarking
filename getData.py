@@ -94,25 +94,29 @@ class Christ:
         self.scoreThreshold = rLambda if scoreThreshold is None else scoreThreshold
         self.t = t
         self.isGeneral = isGeneral
+        self.tkIdx = 0
+
         self.payload_int = int(payload, 2) if payload is not None else 0
         self.key_bytes = key.to_bytes(8, 'big', signed=True)
         self.salt_bytes = salt.to_bytes(8, 'big', signed=True)
         self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
+
         self.log = defaultdict(lambda: defaultdict(list))
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits / self.t, dim=-1)
         cs = F.pad(probs.cumsum(0), (1, 0))
-        self.inH = self.h<self.rLambda # invalidate self.inH regardless if isGeneral status
-        Ys = getYs(self.seed_bytes, self.seed_bytes, None, bitLen) if self.inH else getYs(self.salt_bytes, self.key_bytes, [self.r], bitLen)
+        self.inH = self.h<self.rLambda # always invalidate self.inH at token boundary regardless of isGeneral status
+        Ys = getYs(self.seed_bytes, self.seed_bytes, None, bitLen) if self.inH else getYs(self.salt_bytes, self.key_bytes, [self.r, self.tkIdx], bitLen)
         newTokenId=0
         for bitIdx in range(bitLen):
             p1=getP1(cs,newTokenId,bitIdx)
             newTokenId = (newTokenId<<1) | Ys[bitIdx]<p1
             self.h += getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1)
-            if self.isGeneral and self.h>self.rLambda: # only do within-token invalidation of self.inH and update Ys if isGeneral
+            if self.isGeneral and self.h>self.rLambda: # sometimes invalidate self.inH at bit boundary if isGeneral status, update Ys
                 self.inH = False
-                Ys = getYs(self.salt_bytes, self.key_bytes, [self.r], bitLen)
+                Ys = getYs(self.salt_bytes, self.key_bytes, [self.r, self.tkIdx], bitLen)
+        self.tkIdx += 1
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
     def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:

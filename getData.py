@@ -113,11 +113,18 @@ class Christ:
             p1=getP1(cs,newTokenId,bitIdx)
             newTokenId = (newTokenId<<1) | Ys[bitIdx]<p1
             self.h += getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1)
+
+            self.log['encoder']['y'].append(Ys[bitIdx])
+            self.log['encoder']['p1'].append(p1)
+            self.log['encoder']['binaryEntropy'].append(getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1))
+
             if self.inH: self.r.append(newTokenId&1==1)
             if self.isGeneral and self.h>=self.rLambda: # sometimes invalidate self.inH at bit boundary if isGeneral status, update Ys
                 self.inH = False
                 Ys = getYs(self.salt_bytes, self.key_bytes, [self.r, self.tkIdx], bitLen)
         self.tkIdx += 1
+        self.log['encoder']['vocabEntropy'].append(getEntropy(probs))
+        self.log['encoder']['vocabEmpiricalEntropy'].append(getEmpiricalEntropy(probs, newTokenId))
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
     def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:

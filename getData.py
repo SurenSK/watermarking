@@ -1,17 +1,19 @@
-import torch
-import json
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
-from typing import Dict, List, Union, Optional, Callable, Optional, Any
 import math
 import time
+import random
+import cProfile, pstats
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+import msgpack
+from tqdm import tqdm
+import torch.nn.functional as F
+from datasets import load_dataset
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-import cProfile, pstats
-import hmac, hashlib
-import msgpack
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 2
 MAX_NEW_TOKENS = 500
@@ -48,144 +50,69 @@ def getEmpiricalEntropy(probs: torch.Tensor, selIdx: int) -> float: return -torc
 def getPDF(logits: torch.Tensor, t: float) -> torch.Tensor: return torch.softmax(logits/t, dim=-1)
 def getBinaryEntropy(p: float) -> float: return -(p * math.log2(p) + (1 - p) * math.log2(1 - p)) if 0<p<1 else 0.0
 
-def getP1(p:torch.Tensor,prefix:int,bitIdx:int)->float:
-    v=p.shape[-1]; b=(v-1).bit_length()
+def getP1(cs:torch.Tensor,prefix:int,bitIdx:int)->float:
+    v=cs.shape[-1]-1
+    if v<=0: return 0.0
+    b=(v-1).bit_length()
     if not v or bitIdx>=b: return 0.0
     shift=b-bitIdx; start=prefix<<shift
     if start>=v: return 0.0
-    cs=torch.nn.functional.pad(p.cumsum(0),(1,0))
     s0,s1,s2=cs[start],cs[min(start+(1<<(shift-1)),v)],cs[min(start+(1<<shift),v)]
     if(total:=s2-s0)<1e-9: return 0.0
     return((s2-s1)/total).item()
 
-def getY(salt: bytes, ikm: bytes, context: List[Any]) -> float:
-    info = msgpack.packb(context, use_bin_type=True) if context else b""
-    msg = len(salt).to_bytes(4, 'big') + salt + len(info).to_bytes(4, 'big') + info
-    digest = hmac.new(ikm, msg, hashlib.sha256).digest()
-    seed = int.from_bytes(digest[:8], 'big')
-    return seed / (2**64 - 1)
+def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]:
+    L=blen*8
+    max_l=255*hashes.SHA256.digest_size
+    if L > max_l:
+        raise ValueError(f"Requested bytes {L} exceeds HKDF-SHA256 limit of {max_l}")
+    info=msgpack.packb(context, use_bin_type=True) if context else b""
+    hkdf=HKDF(algorithm=hashes.SHA256(),length=L,salt=salt,info=info)
+    output_bytes=hkdf.derive(ikm)
+    divisor=2**64-1
+    chunk_size=8
+    return [
+        int.from_bytes(output_bytes[i*chunk_size:(i+1)*chunk_size],'big')/divisor
+        for i in range(blen)
+    ]
+
+def getYs_batch_mp(
+    jobs: List[Tuple[bytes, bytes, List[Any], int]], 
+    max_workers: Optional[int] = None
+) -> List[List[float]]:
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        nw = ex._max_workers if ex._max_workers else 1
+        cs = max(1, math.ceil(len(jobs) / nw))
+        return list(ex.map(lambda j_args: getYs(*j_args), jobs, chunksize=cs))
 
 class Christ:
-    """
-    Implements the watermarking algorithm from "Undetectable Watermarks for Language Models"
-    by Christ et al. (2023). This method embeds a watermark by pseudorandomly selecting
-    token bits during generation, conditioned on a secret key.
-    """
     def __init__(self, key: int, salt: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = False):
-        """
-        Initializes the watermarking processor.
-
-        Args:
-            key (int): The secret key for the watermark PRF.
-            rLambda (float): The target entropy threshold to accumulate before watermarking begins.
-            random_seed (int): A public random seed for the entropy accumulation phase.
-            t (float): The temperature for softmax scaling of logits.
-            payload (Optional[str]): A binary string to embed as a message.
-            scoreThreshold (Optional[float]): The z-score threshold for detection. Defaults to rLambda.
-            isGeneral (bool): If True, uses the "general scheme" where entropy is checked per-token.
-                              If False, uses the original scheme with a one-time switch to watermarking.
-        """
-        self.key=key
-        self.rLambda=rLambda
-        self.random_seed=random_seed
-        self.t=t
-        self.isGeneral=isGeneral
-        self.payload_int=int(payload,2)if payload is not None else 0
-        self.scoreThreshold=rLambda if scoreThreshold is None else scoreThreshold
-        
-        # State variables
-        self.h,self.r,self.tokenIdx=0.0,[],0 # h: accumulated entropy, r: public randomness sequence, tokenIdx: token counter
-        self.in_entropy_phase=True # Flag indicating if we are in the initial entropy accumulation phase
-
-        # Pre-compute byte representations of keys/seeds for the PRF
-        self.key = key
-        self.salt = salt
-        self.seed = random_seed
-        self.key_bytes=key.to_bytes(8,'big',signed=True)
-        self.salt_bytes=salt.to_bytes(8,'big',signed=True)
-        self.seed_bytes=random_seed.to_bytes(8,'big',signed=True)
-        
-        # Separate RNG for any stochastic sampling (not used in this deterministic implementation)
-        self.sampling_rng=torch.Generator(device=device)
-        self.sampling_rng.manual_seed(random_seed+1)
-        
-        # Logging dictionary
-        self.log=defaultdict(lambda:defaultdict(list))
-        self.log['params']={'key':key,'rLambda':rLambda,'random_seed':random_seed,'t':t,'payload':payload,'scoreThreshold':scoreThreshold,'isGeneral':isGeneral}
+        self.h = 0.0
+        self.inH = True
+        self.r: List[int] = []
+        self.rLambda = rLambda
+        self.scoreThreshold = rLambda if scoreThreshold is None else scoreThreshold
+        self.t = t
+        self.isGeneral = isGeneral
+        self.payload_int = int(payload, 2) if payload is not None else 0
+        self.key_bytes = key.to_bytes(8, 'big', signed=True)
+        self.salt_bytes = salt.to_bytes(8, 'big', signed=True)
+        self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
+        self.log = defaultdict(lambda: defaultdict(list))
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        The encoding function. Given logits, it determines the next token ID
-        by selecting its bits one by one according to the watermarking scheme.
-        This is designed to be used as a logits processor in a generation loop.
-
-        Args:
-            logits (torch.Tensor): The raw logits from the language model for the next token.
-
-        Returns:
-            torch.Tensor: A tensor containing the selected watermarked token ID.
-        """
-        startTime=time.time()
-        probs=torch.softmax(logits/self.t,dim=-1)
+        probs = torch.softmax(logits / self.t, dim=-1)
+        cs = F.pad(probs.cumsum(0), (1, 0))
+        self.inH = self.h<self.rLambda # invalidate self.inH regardless if isGeneral status
+        Ys = getYs(self.seed_bytes, self.seed_bytes, None, bitLen) if self.inH else getYs(self.salt_bytes, self.key_bytes, [self.r], bitLen)
         newTokenId=0
-        self.log['encode']['vocab_entropy'].append(getEntropy(probs))
-        
-        if self.isGeneral:
-            # General Scheme: Check entropy threshold at the start of each token generation.
-            generalFlag = self.h < self.rLambda
-            for bitIdx in range(bitLen):
-                p1=getP1(probs,newTokenId,bitIdx)
-                self.log['encode']['p1'].append(p1)
-                self.log['encode']['binary_entropy'].append(getBinaryEntropy(p1))
-                if generalFlag:
-                    # Entropy Accumulation Phase for this token: Use public seed.
-                    y=getY(len(self.r).to_bytes(8,'big',signed=True),self.seed_bytes,None)
-                    nextBit=1 if y<p1 else 0
-                    probChosen=p1 if nextBit==1 else(1-p1)
-                    score=-math.log(probChosen+1e-9)
-                    self.h+=score # Accumulate entropy
-                    self.r.append(nextBit) # Append bit to public randomness list
-                    self.log['encode']['y'].append(y)
-                    self.log['encode']['binary_empirical_entropy'].append(score)
-                else:
-                    # Watermarking Phase for this token: Use secret key.
-                    context=[self.r,self.tokenIdx,bitIdx,self.payload_int]
-                    y=getY(self.salt_bytes,self.key_bytes,context)
-                    nextBit=1 if y<p1 else 0
-                    probChosen=p1 if nextBit==1 else(1-p1)
-                    self.log['encode']['y'].append(y)
-                    self.log['encode']['binary_empirical_entropy'].append(-math.log(probChosen+1e-9))
-                newTokenId=(newTokenId<<1)+nextBit
-        else:
-            # Original Scheme: A single switch from entropy accumulation to watermarking.
-            for bitIdx in range(bitLen):
-                p1=getP1(probs,newTokenId,bitIdx)
-                self.log['encode']['p1'].append(p1)
-                self.log['encode']['binary_entropy'].append(getBinaryEntropy(p1))
-                if self.in_entropy_phase:
-                    y=getY(len(self.r).to_bytes(8,'big',signed=True),self.seed_bytes,None)
-                    nextBit=1 if y<p1 else 0
-                    probChosen=p1 if nextBit==1 else(1-p1)
-                    score=-math.log(probChosen+1e-9)
-                    self.h+=score # Accumulate entropy
-                    self.r.append(nextBit) # Append bit to public randomness list
-                    self.log['encode']['y'].append(y)
-                    self.log['encode']['binary_empirical_entropy'].append(score)
-                    if self.h>=self.rLambda: self.in_entropy_phase=False # Check if we have enough entropy to switch
-                else:
-                    # Watermarking Phase: Use secret key.
-                    context=[self.r,self.tokenIdx,bitIdx,self.payload_int]
-                    y=getY(self.salt_bytes,self.key_bytes,context)
-                    nextBit=1 if y<p1 else 0
-                    probChosen=p1 if nextBit==1 else(1-p1)
-                    self.log['encode']['y'].append(y)
-                    self.log['encode']['binary_empirical_entropy'].append(-math.log(probChosen+1e-9))
-                newTokenId=(newTokenId<<1)+nextBit
-        
-        self.tokenIdx+=1
-        self.log['encode']['vocab_entropy'].append(getEntropy(probs))
-        self.log['encode']['vocab_empirical_entropy'].append(getEmpiricalEntropy(probs,newTokenId))
-        self.log['encode']['time'].append(time.time()-startTime)
+        for bitIdx in range(bitLen):
+            p1=getP1(cs,newTokenId,bitIdx)
+            newTokenId = (newTokenId<<1) | Ys[bitIdx]<p1
+            self.h += getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1)
+            if self.isGeneral and self.h>self.rLambda: # only do within-token invalidation of self.inH and update Ys if isGeneral
+                self.inH = False
+                Ys = getYs(self.salt_bytes, self.key_bytes, [self.r], bitLen)
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
     def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:

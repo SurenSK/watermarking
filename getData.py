@@ -128,83 +128,24 @@ class Christ:
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
     def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:
-        """
-        Detects the watermark in a sequence of token IDs.
-
-        Args:
-            tokenIds (List[int]): The list of token IDs to analyze.
-            payloadLen (Optional[int]): The length of the message to search for. If None or 0,
-                                        assumes no message is embedded.
-
-        Returns:
-            Dict: A dictionary containing detection results: 'detected' (bool),
-                  'score' (float), 'n_star' (int), and 'message' (str).
-        """
-        startTime=time.time()
-        if not tokenIds: return {'detected': False, 'score': -math.inf, 'n_star': 0, 'message': ''}
-        
-        # Convert all tokens to a single sequence of bits
         fullBinary=[int(b) for t in tokenIds for b in format(t,f'0{bitLen}b')]
         totalBits=len(fullBinary)
+        nMessages=2**payloadLen if payloadLen is not None and payloadLen>0 else 1
         
-        # Define the search space for n*, the number of initial bits assumed to be random (not watermarked)
-        n_star_step=bitLen if self.isGeneral else 1
-        search_range=range(0,totalBits+1,n_star_step)
-        num_offsets=len(search_range)
-        
-        # Define the search space for the embedded message
-        num_messages=2**payloadLen if payloadLen is not None and payloadLen>0 else 1
-        
-        # Tensors for logging and analysis
-        y_tensor=torch.zeros((totalBits,num_messages,num_offsets))
-        scores_tensor=torch.zeros((totalBits,num_messages,num_offsets))
-        norm_scores_matrix=torch.full((num_messages,num_offsets),-math.inf)
-        
-        best_overall_score,best_message_int,best_n_star=-math.inf,-1,0
-        
-        # Exhaustive search over all possible payloads and n* offsets
-        for p_idx,payload_hyp_int in enumerate(range(num_messages)):
-            for o_idx,offset in enumerate(tqdm(search_range, desc=f"Sweeping n* for payload {payload_hyp_int}", leave=False)):
-                currentScore,rSeq=0.0,fullBinary[:offset]
-                
-                # Calculate the log-likelihood score for the watermarked portion of the bit sequence
-                for bitPos in range(offset,totalBits):
-                    tokenIdx,bitIdx=bitPos//bitLen,bitPos%bitLen
-                    
-                    # Reconstruct the PRF context for this bit position
-                    # context=torch.tensor(rSeq+[tokenIdx,bitIdx,payload_hyp_int],dtype=torch.float64)
-                    context=[self.r,self.tokenIdx,bitIdx,self.payload_int]
-                    # yPrf=getYTGEN(self.salt,self.key,context)
-                    yPrf=getY(self.salt_bytes,self.key_bytes,context) # Re-generate the PRF value
-                    
-                    obsBit=fullBinary[bitPos]
-                    v=yPrf if obsBit==1 else(1-yPrf) # Probability of observing this bit under the watermark hypothesis
-                    bit_score=-math.log(v+1e-9)
-                    currentScore+=bit_score
-                    
-                    y_tensor[bitPos,p_idx,o_idx]=yPrf
-                    scores_tensor[bitPos,p_idx,o_idx]=bit_score
-                
-                # Normalize the score to get a z-score like statistic
-                wmLen=totalBits-offset
-                normScore=(currentScore-wmLen)/math.sqrt(wmLen)if wmLen>0 else 0.0
-                norm_scores_matrix[p_idx,o_idx]=normScore
-                
-                # Keep track of the best hypothesis found so far
-                if normScore>best_overall_score:
-                    best_overall_score,best_message_int,best_n_star=normScore,payload_hyp_int,offset
-        
-        # Make a detection decision based on the threshold
-        detected=best_overall_score>self.scoreThreshold
-        message=""
-        if detected and payloadLen is not None and payloadLen>0:
-            message=format(best_message_int,f'0{payloadLen}b')
-            
-        self.log['decode']['time']=time.time()-startTime
-        self.log['decode']['y_tensor']=y_tensor
-        self.log['decode']['scores_tensor']=scores_tensor
-        self.log['decode']['norm_scores_matrix']=norm_scores_matrix
-        return {'detected': detected, 'score': best_overall_score, 'n_star': best_n_star, 'message': message}
+        Ys = torch.zeros((nMessages, totalBits, totalBits))
+        # fill Ys with getYs_batch_mp() call
+        # repeat fullBinary (1,1,totalBits) to get (nMessages, totalBits, totalBits)
+        # v = -math.log2(Ys[fullBinary==1] + 1-Ys[fullBinary!=1])
+        # normScores = sum v down along offsets, (v.sum(dim=1)-(totalBits-offset))/math.sqrt(totalBits-offset)
+        # normScores should be a (nMessages, totalBits) tensor, indicating best offset + payload combination found
+        # self.log['decoder']['y']=Ys
+        # self.log['decoder']['scores']=v
+        # self.log['decoder']['normScores']=normScores
+        # maxIdx = torch.argmax(normScores)
+        # message_ = maxIdx // totalBits
+        # n_ = maxIdx % totalBits
+        # score_ = normScores[message_][n_]
+        # return {'detected': score_>self.scoreThreshold, 'score': score_, 'n_star': n_, 'message': message_}
 
 @torch.no_grad()
 def generateSequence(model, tokenizer, prompt: str, algo, maxLen: int):

@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 2
-MAX_NEW_TOKENS = 50
+MAX_NEW_TOKENS = 500
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 DATASET_ID = "allenai/c4"
 DATASET_CONFIG = "en.noblocklist"
@@ -167,11 +167,13 @@ class Christ:
         scores = -torch.log(v)  # (nMessages, nOffsets, totalBits)
 
         # Mask out acausal prefix (only bits from offset onward count)
-        tri = torch.triu(torch.ones(totalBits, totalBits, device=device, dtype=torch.float64))
-        mask = tri.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
-        # MS[m, o_idx, k] = score for hypo (m, offsets[o_idx]) starting at bit k
-        masked_scores = (scores.unsqueeze(-2) * mask).sum(dim=-1) # (M, nOffsets, T)
-
+        # tri = torch.triu(torch.ones(totalBits, totalBits, device=device, dtype=torch.float64))
+        # mask = tri.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+        # # MS[m, o_idx, k] = score for hypo (m, offsets[o_idx]) starting at bit k
+        # masked_scores = (scores.unsqueeze(-2) * mask).sum(dim=-1) # (M, nOffsets, T)
+        # Efficiently compute the suffix sum: masked_scores[m, o, k] = SUM_{j=k}^{T-1} scores[m, o, j]
+        # This avoids materializing the O(T^3) intermediate tensor.
+        masked_scores = torch.cumsum(scores.flip(dims=[-1]), dim=-1).flip(dims=[-1])
         offset_vals_t = torch.tensor(offsets, device=device)
 
         if self.isGeneral:
@@ -242,6 +244,7 @@ def main():
 
         wmEncoder = Christ(**WM_PARAMS)
         wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
+        pass
         # print(wmEncoder.log['encoder']['y'][:20])
         # print(len(wmEncoder.r))
         # print(wmEncoder.r)

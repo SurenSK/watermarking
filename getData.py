@@ -67,10 +67,9 @@ def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]
     info=msgpack.packb(context, use_bin_type=True) if context else b""
     hkdf=HKDF(algorithm=hashes.SHA256(),length=L,salt=salt,info=info)
     output_bytes=hkdf.derive(ikm)
-    divisor=2**64-1
-    chunk_size=8
+    bytesPer=8
     return [
-        int.from_bytes(output_bytes[i*chunk_size:(i+1)*chunk_size],'big')/divisor
+        int.from_bytes(output_bytes[i*bytesPer:(i+1)*bytesPer],'big')/2**64-1
         for i in range(blen)
     ]
 
@@ -251,6 +250,7 @@ def main():
         # pass
         wmDecoder = Christ(**WM_PARAMS)
         wmRes = wmDecoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
+        print(f"{time.time()-t0:.2f}s/prompt")
         pass
         nwmEncoder = Christ(**NWM_PARAMS)
         nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
@@ -259,7 +259,6 @@ def main():
 
         data.append({'prompt_id':i,'encoder_log':wmEncoder.log,'decoder_log':wmDecoder.log,'is_wm':True,'detected':wmRes['detected']})
         data.append({'prompt_id':i,'encoder_log':nwmEncoder.log,'decoder_log':nwmDecoder.log,'is_wm':False,'detected':nwmRes['detected']})
-        print(f"{time.time()-t0:.2f}s/prompt")
         pass
 
     # torch.save(data, "experiment_results.pt")

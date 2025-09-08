@@ -15,8 +15,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-N_PROMPTS = 2
-MAX_NEW_TOKENS = 500
+N_PROMPTS = 5
+MAX_NEW_TOKENS = 50
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 DATASET_ID = "allenai/c4"
 DATASET_CONFIG = "en.noblocklist"
@@ -69,7 +69,7 @@ def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]
     output_bytes=hkdf.derive(ikm)
     bytesPer=8
     return [
-        int.from_bytes(output_bytes[i*bytesPer:(i+1)*bytesPer],'big')/2**64-1
+        int.from_bytes(output_bytes[i*bytesPer:(i+1)*bytesPer],'big')/(2**64-1)
         for i in range(blen)
     ]
 
@@ -113,7 +113,7 @@ class Christ:
         newTokenId=0
         for bitIdx in range(bitLen):
             p1=getP1(cs,newTokenId,bitIdx)
-            newTokenId = (newTokenId<<1) | 1*(Ys[bitIdx]<p1)
+            newTokenId = (newTokenId<<1) | (1 if Ys[bitIdx]<p1 else 0)
             self.h += getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1)
 
             self.log['encoder']['y'].append(Ys[bitIdx])
@@ -124,6 +124,8 @@ class Christ:
             if self.isGeneral and self.h>=self.rLambda: # sometimes invalidate self.inH at bit boundary if isGeneral status, update Ys
                 self.inH = False
                 Ys = getYs(self.salt_bytes, self.key_bytes, [self.payload_int, self.r, self.tkIdx], bitLen)
+        # if newTokenId>len(tokenizer): newTokenId=len(tokenizer)-1
+        pass
         self.tkIdx += 1
         self.log['encoder']['vocabEntropy'].append(getEntropy(probs))
         self.log['encoder']['vocabEmpiricalEntropy'].append(getEmpiricalEntropy(probs, newTokenId))
@@ -250,21 +252,21 @@ def main():
         # pass
         wmDecoder = Christ(**WM_PARAMS)
         wmRes = wmDecoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
-        print(f"{time.time()-t0:.2f}s/prompt")
+        print(f"{time.time()-t0:.2f}s/prompt {wmRes}")
         pass
-        nwmEncoder = Christ(**NWM_PARAMS)
-        nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
-        nwmDecoder = Christ(**WM_PARAMS) # Detector uses WM key
-        nwmRes = nwmDecoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)
+        # nwmEncoder = Christ(**NWM_PARAMS)
+        # nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
+        # nwmDecoder = Christ(**WM_PARAMS) # Detector uses WM key
+        # nwmRes = nwmDecoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)
 
-        data.append({'prompt_id':i,'encoder_log':wmEncoder.log,'decoder_log':wmDecoder.log,'is_wm':True,'detected':wmRes['detected']})
-        data.append({'prompt_id':i,'encoder_log':nwmEncoder.log,'decoder_log':nwmDecoder.log,'is_wm':False,'detected':nwmRes['detected']})
+        # data.append({'prompt_id':i,'encoder_log':wmEncoder.log,'decoder_log':wmDecoder.log,'is_wm':True,'detected':wmRes['detected']})
+        # data.append({'prompt_id':i,'encoder_log':nwmEncoder.log,'decoder_log':nwmDecoder.log,'is_wm':False,'detected':nwmRes['detected']})
         pass
 
     # torch.save(data, "experiment_results.pt")
 
 if __name__ == "__main__":
-    cProfile.run('main()', 'output.prof')
+    cProfile.run('main()', 'mBitmProcHKDF.prof')
 
     stats = pstats.Stats('output.prof')
     stats.sort_stats(pstats.SortKey.CUMULATIVE).print_stats(20) # Print top 20 cumulative time functions

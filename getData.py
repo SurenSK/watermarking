@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 2
-MAX_NEW_TOKENS = 500
+MAX_NEW_TOKENS = 50
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 DATASET_ID = "allenai/c4"
 DATASET_CONFIG = "en.noblocklist"
@@ -29,21 +29,19 @@ WM_PARAMS = {
     'random_seed': 42,
     't': 1.0,
     'payload': None,
-    'isGeneral': False
+    'isGeneral': True
 }
 NWM_PARAMS = {**WM_PARAMS, 'rLambda': float('inf')}
 PAYLOAD_LEN_DETECT = 0
 
 def setup():
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     dataset = load_dataset(DATASET_ID, DATASET_CONFIG, split="train", streaming=True)
     return model, tokenizer, dataset
 
+model, tokenizer, dataset, bitLen = None, None, None, None
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model, tokenizer, dataset = setup()
-dataset = iter(dataset)
-bitLen = math.ceil(math.log2(len(tokenizer)))
 
 def getEntropy(probs: torch.Tensor) -> float: return -torch.sum(probs * torch.log(probs + 1e-9)).item()
 def getEmpiricalEntropy(probs: torch.Tensor, selIdx: int) -> float: return -torch.log(probs[selIdx] + 1e-9).item()
@@ -76,17 +74,22 @@ def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]
         for i in range(blen)
     ]
 
-def getYs_batch_mp(
+def _unpack_and_call_getYs(j_args):
+    """Unpacks arguments and calls getYs."""
+    return getYs(*j_args)
+
+def getYsBatched(
     jobs: List[Tuple[bytes, bytes, List[Any], int]], 
     max_workers: Optional[int] = None
 ) -> List[List[float]]:
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         nw = ex._max_workers if ex._max_workers else 1
         cs = max(1, math.ceil(len(jobs) / nw))
-        return list(ex.map(lambda j_args: getYs(*j_args), jobs, chunksize=cs))
+        # Use the named helper function instead of a lambda
+        return list(ex.map(_unpack_and_call_getYs, jobs, chunksize=cs))
 
 class Christ:
-    def __init__(self, key: int, salt: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = False):
+    def __init__(self, key: int, salt: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = True):
         self.h = 0.0
         self.inH = True
         self.r: List[int] = []
@@ -107,45 +110,89 @@ class Christ:
         probs = torch.softmax(logits / self.t, dim=-1)
         cs = F.pad(probs.cumsum(0), (1, 0))
         self.inH = self.h<self.rLambda # always invalidate self.inH at token boundary regardless of isGeneral status
-        Ys = getYs(self.seed_bytes, self.seed_bytes, None, bitLen) if self.inH else getYs(self.salt_bytes, self.key_bytes, [self.r, self.tkIdx], bitLen)
+        Ys = getYs(self.seed_bytes, self.seed_bytes, None, bitLen) if self.inH else getYs(self.salt_bytes, self.key_bytes, [self.payload_int, self.r, self.tkIdx], bitLen)
         newTokenId=0
         for bitIdx in range(bitLen):
             p1=getP1(cs,newTokenId,bitIdx)
-            newTokenId = (newTokenId<<1) | Ys[bitIdx]<p1
+            newTokenId = (newTokenId<<1) | 1*(Ys[bitIdx]<p1)
             self.h += getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1)
 
             self.log['encoder']['y'].append(Ys[bitIdx])
             self.log['encoder']['p1'].append(p1)
             self.log['encoder']['binaryEntropy'].append(getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1))
 
-            if self.inH: self.r.append(newTokenId&1==1)
+            if self.inH: self.r.append(newTokenId&1)
             if self.isGeneral and self.h>=self.rLambda: # sometimes invalidate self.inH at bit boundary if isGeneral status, update Ys
                 self.inH = False
-                Ys = getYs(self.salt_bytes, self.key_bytes, [self.r, self.tkIdx], bitLen)
+                Ys = getYs(self.salt_bytes, self.key_bytes, [self.payload_int, self.r, self.tkIdx], bitLen)
         self.tkIdx += 1
         self.log['encoder']['vocabEntropy'].append(getEntropy(probs))
         self.log['encoder']['vocabEmpiricalEntropy'].append(getEmpiricalEntropy(probs, newTokenId))
         return torch.tensor(newTokenId,dtype=torch.long,device=device)
 
-    def decode(self, tokenIds: List[int], payloadLen: Optional[int] = None) -> Dict:
-        fullBinary=[int(b) for t in tokenIds for b in format(t,f'0{bitLen}b')]
-        totalBits=len(fullBinary)
-        nMessages=2**payloadLen if payloadLen is not None and payloadLen>0 else 1
-        
-        Ys = torch.zeros((nMessages, totalBits, totalBits))
-        # fill Ys with getYs_batch_mp() call
-        # repeat fullBinary (1,1,totalBits) to get (nMessages, totalBits, totalBits)
-        # v = -math.log2(Ys[fullBinary==1] + 1-Ys[fullBinary!=1])
-        # normScores = sum v down along offsets, (v.sum(dim=1)-(totalBits-offset))/math.sqrt(totalBits-offset)
-        # normScores should be a (nMessages, totalBits) tensor, indicating best offset + payload combination found
-        # self.log['decoder']['y']=Ys
-        # self.log['decoder']['scores']=v
-        # self.log['decoder']['normScores']=normScores
-        # maxIdx = torch.argmax(normScores)
-        # message_ = maxIdx // totalBits
-        # n_ = maxIdx % totalBits
-        # score_ = normScores[message_][n_]
-        # return {'detected': score_>self.scoreThreshold, 'score': score_, 'n_star': n_, 'message': message_}
+    def decode(self, tokenIds: List[int], payloadLen: Optional[int] = 0) -> Dict:
+        fullBinary = [int(b) for t in tokenIds for b in format(t, f'0{bitLen}b')]
+        totalBits = len(fullBinary)
+        numTokens = len(tokenIds)
+        offsets = list(range(0, totalBits + 1, 1 if self.isGeneral else bitLen))
+
+        # Payload hypotheses
+        nMessages = 2**payloadLen
+        payloads = list(range(nMessages))
+        pass
+        # Build all jobs: (salt, key, [payload, r_prefix, tkIdx], bitLen)
+        jobs = []
+        for m_ in payloads:
+            for offset in offsets:
+                r_ = fullBinary[:offset]
+                for tkIdx in range(numTokens):
+                    jobs.append((self.salt_bytes, self.key_bytes, [m_, r_, tkIdx], bitLen))
+
+        # Call PRF once for all jobs
+        Ylist = getYsBatched(jobs)
+        Ys = (
+            torch.tensor(Ylist, dtype=torch.float64, device=device)
+            .reshape(nMessages, len(offsets), numTokens, bitLen)
+            .flatten(2, 3)  # -> (nMessages, nOffsets, totalBits)
+        )
+        pass
+        # Observed bitstream
+        B = torch.tensor(fullBinary, dtype=torch.int64, device=device).view(1, 1, totalBits)
+
+        # Compute log-likelihood scores
+        p = Ys.clamp(min=1e-9, max=1 - 1e-9)
+        v = torch.where(B == 1, p, 1.0 - p)
+        scores = -torch.log(v)  # (nMessages, nOffsets, totalBits)
+
+        # Mask out acausal prefix (only bits from offset onward count)
+        tri = torch.triu(torch.ones(totalBits, totalBits, device=device, dtype=torch.float64))
+        mask = tri.unsqueeze(0).unsqueeze(0)  # (1,1,totalBits,totalBits)
+        masked_scores = (scores.unsqueeze(-2) * mask).sum(dim=-1)  # (nMessages,nOffsets,totalBits)
+
+        # Effective watermark length for each offset
+        wm_len = (totalBits - torch.arange(totalBits, device=device, dtype=torch.float64)).clamp_min(1)
+        norm_scores = (masked_scores.sum(dim=2) - wm_len) / wm_len.sqrt()  # (nMessages, nOffsets)
+
+        # Keep only valid offsets
+        if not self.isGeneral:
+            valid_mask = torch.zeros(len(offsets), dtype=torch.bool, device=device)
+            valid_mask[::bitLen] = True
+            norm_scores = norm_scores.masked_fill(~valid_mask.unsqueeze(0), float('-inf'))
+
+        # Best hypothesis
+        max_val, max_idx = torch.max(norm_scores.view(-1), dim=0)
+        best_message = (max_idx // len(offsets)).item()
+        best_offset = offsets[(max_idx % len(offsets)).item()]
+        best_score = max_val.item()
+
+        detected = best_score > self.scoreThreshold
+        message = format(best_message, f'0{payloadLen}b') if detected and payloadLen else ''
+
+        self.log['decoder']['y'] = Ys.detach().cpu()
+        self.log['decoder']['scores'] = scores.detach().cpu()
+        self.log['decoder']['normScores'] = norm_scores.detach().cpu()
+
+        return {'detected': detected, 'score': best_score, 'n_star': best_offset, 'message': message}
 
 @torch.no_grad()
 def generateSequence(model, tokenizer, prompt: str, algo, maxLen: int):
@@ -162,12 +209,20 @@ def generateSequence(model, tokenizer, prompt: str, algo, maxLen: int):
     return inputIds.squeeze(0)[initLen:].tolist()
 
 def main():
+    global model, tokenizer, dataset, bitLen
+    model, tokenizer, dataset = setup()
+    dataset = iter(dataset)
+    bitLen = math.ceil(math.log2(len(tokenizer)))
     data = []
     for i in tqdm(range(N_PROMPTS), desc="Processing Prompts"):
         prompt_text = next(dataset)['text'][:256] # Truncate long prompts
 
         wmEncoder = Christ(**WM_PARAMS)
         wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
+        # print(wmEncoder.log['encoder']['y'][:20])
+        # print(len(wmEncoder.r))
+        # print(wmEncoder.r)
+        # pass
         wmDecoder = Christ(**WM_PARAMS)
         wmRes = wmDecoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
 

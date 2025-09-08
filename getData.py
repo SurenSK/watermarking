@@ -242,6 +242,7 @@ def main():
     for i in tqdm(range(N_PROMPTS), desc="Processing Prompts"):
         t0 = time.time()
         prompt_text = next(dataset)['text'][:256] # Truncate long prompts
+        pass
 
         wmEncoder = Christ(**WM_PARAMS)
         wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)

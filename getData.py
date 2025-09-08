@@ -166,18 +166,37 @@ class Christ:
 
         # Mask out acausal prefix (only bits from offset onward count)
         tri = torch.triu(torch.ones(totalBits, totalBits, device=device, dtype=torch.float64))
-        mask = tri.unsqueeze(0).unsqueeze(0)  # (1,1,totalBits,totalBits)
-        masked_scores = (scores.unsqueeze(-2) * mask).sum(dim=-1)  # (nMessages,nOffsets,totalBits)
+        mask = tri.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+        # MS[m, o_idx, k] = score for hypo (m, offsets[o_idx]) starting at bit k
+        masked_scores = (scores.unsqueeze(-2) * mask).sum(dim=-1) # (M, nOffsets, T)
 
-        # Effective watermark length for each offset
-        wm_len = (totalBits - torch.arange(totalBits, device=device, dtype=torch.float64)).clamp_min(1)
-        norm_scores = (masked_scores.sum(dim=2) - wm_len) / wm_len.sqrt()  # (nMessages, nOffsets)
+        offset_vals_t = torch.tensor(offsets, device=device)
 
-        # Keep only valid offsets
-        if not self.isGeneral:
-            valid_mask = torch.zeros(len(offsets), dtype=torch.bool, device=device)
-            valid_mask[::bitLen] = True
-            norm_scores = norm_scores.masked_fill(~valid_mask.unsqueeze(0), float('-inf'))
+        if self.isGeneral:
+            # Efficiently extract the diagonal for the isGeneral=True case
+            # This works because offsets[o_idx] == o_idx
+            total_nll = torch.diagonal(masked_scores, dim1=-2, dim2=-1)
+            
+            # Pad for the final offset (offset=T, L=0, score=0)
+            zero_pad = torch.zeros((nMessages, 1), device=device, dtype=torch.float64)
+            total_nll = torch.cat([total_nll, zero_pad], dim=1) # Shape (M, nOffsets)
+        else:
+            # For isGeneral=False, offsets are sparse. We must use advanced indexing.
+            # We need to extract masked_scores[m, o_idx, offsets[o_idx]] for each hypothesis.
+            msg_indices = torch.arange(nMessages, device=device).view(-1, 1)
+            offset_indices = torch.arange(len(offsets), device=device).view(1, -1)
+            
+            # offset_vals_t contains the actual bit positions [0, 15, 30, ...]
+            bit_start_indices = offset_vals_t.view(1, -1)
+
+            total_nll = masked_scores[msg_indices, offset_indices, bit_start_indices]
+
+        # Effective watermark length L for EACH offset hypothesis
+        wm_len = (totalBits - offset_vals_t).unsqueeze(0).float() # Shape (1, nOffsets)
+
+        # Normalize: (Score - L) / sqrt(L). Add epsilon to avoid div by zero for L=0.
+        norm_scores = (total_nll - wm_len) / (wm_len + 1e-9).sqrt()        
+        # The L=0 case (last offset) results in 0/eps = 0, which is correct.
 
         # Best hypothesis
         max_val, max_idx = torch.max(norm_scores.view(-1), dim=0)
@@ -225,7 +244,7 @@ def main():
         # pass
         wmDecoder = Christ(**WM_PARAMS)
         wmRes = wmDecoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
-
+        pass
         nwmEncoder = Christ(**NWM_PARAMS)
         nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
         nwmDecoder = Christ(**WM_PARAMS) # Detector uses WM key
@@ -233,6 +252,7 @@ def main():
 
         data.append({'prompt_id':i,'encoder_log':wmEncoder.log,'decoder_log':wmDecoder.log,'is_wm':True,'detected':wmRes['detected']})
         data.append({'prompt_id':i,'encoder_log':nwmEncoder.log,'decoder_log':nwmDecoder.log,'is_wm':False,'detected':nwmRes['detected']})
+        pass
 
     # torch.save(data, "experiment_results.pt")
 

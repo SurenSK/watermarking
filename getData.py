@@ -149,6 +149,7 @@ class Christ:
                     jobs.append((self.salt_bytes, self.key_bytes, [m_, r_, tkIdx], bitLen))
 
         # Call PRF once for all jobs
+        t0 = time.time()
         Ylist = getYsBatched(jobs)
         Ys = (
             torch.tensor(Ylist, dtype=torch.float64, device=device)
@@ -156,6 +157,7 @@ class Christ:
             .flatten(2, 3)  # -> (nMessages, nOffsets, totalBits)
         )
         pass
+        print(f"{time.time()-t0:.2f}s")
         # Observed bitstream
         B = torch.tensor(fullBinary, dtype=torch.int64, device=device).view(1, 1, totalBits)
 
@@ -221,6 +223,7 @@ def generateSequence(model, tokenizer, prompt: str, algo, maxLen: int):
     for _ in range(maxLen):
         outputs = model(input_ids=lastToken, past_key_values=cache, use_cache=True)
         logits, cache = outputs.logits[0, -1, :], outputs.past_key_values
+        logits[tokenizer.eos_token_id] = -float('inf') 
         newToken = algo(logits).unsqueeze(0)
         if newToken.item() == tokenizer.eos_token_id: break
         inputIds = torch.cat([inputIds, newToken.unsqueeze(0)], dim=1)
@@ -234,6 +237,7 @@ def main():
     bitLen = math.ceil(math.log2(len(tokenizer)))
     data = []
     for i in tqdm(range(N_PROMPTS), desc="Processing Prompts"):
+        t0 = time.time()
         prompt_text = next(dataset)['text'][:256] # Truncate long prompts
 
         wmEncoder = Christ(**WM_PARAMS)
@@ -252,6 +256,7 @@ def main():
 
         data.append({'prompt_id':i,'encoder_log':wmEncoder.log,'decoder_log':wmDecoder.log,'is_wm':True,'detected':wmRes['detected']})
         data.append({'prompt_id':i,'encoder_log':nwmEncoder.log,'decoder_log':nwmDecoder.log,'is_wm':False,'detected':nwmRes['detected']})
+        print(f"{time.time()-t0:.2f}s/prompt")
         pass
 
     # torch.save(data, "experiment_results.pt")

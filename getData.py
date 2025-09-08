@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 5
-MAX_NEW_TOKENS = 50
+MAX_NEW_TOKENS = 500
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 DATASET_ID = "allenai/c4"
 DATASET_CONFIG = "en.noblocklist"
@@ -83,7 +83,7 @@ def getYsBatched(
 ) -> List[List[float]]:
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         nw = ex._max_workers if ex._max_workers else 1
-        cs = max(1, math.ceil(len(jobs) / nw))
+        cs = max(1, math.ceil(len(jobs) / (nw*32)))
         # Use the named helper function instead of a lambda
         return list(ex.map(_unpack_and_call_getYs, jobs, chunksize=cs))
 

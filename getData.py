@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 5
 MAX_NEW_TOKENS = 500
-MODEL_ID = "meta-llama/Llama-2-7b-hf"
+MODEL_ID = "meta-llama/Llama-2-7b"
 DATASET_ID = "allenai/c4"
 DATASET_CONFIG = "en.noblocklist"
 

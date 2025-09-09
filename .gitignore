@@ -5,3 +5,4 @@ _*
 .env
 output*
 experiment_results*
+results/*

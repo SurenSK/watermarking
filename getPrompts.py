@@ -12,7 +12,6 @@ print(f"Generating '{OUTPUT_FILE}' with {NUM_PROMPTS} prompts, each truncated to
 dataset = load_dataset(DATASET_ID, DATASET_CONFIG, split="train", streaming=True)
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     for example in islice(dataset, NUM_PROMPTS):
-        # THE FIX: Split the text, take the first 20 words, and rejoin.
         words = example['text'].split()
         truncated_text = ' '.join(words[:WORD_LIMIT])
         f.write(truncated_text + "\n")

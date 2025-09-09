@@ -34,7 +34,7 @@ def getYs_v2_mul(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List
     hkdf=HKDF(algorithm=hashes.SHA256(),length=L,salt=salt,info=info)
     output_bytes=hkdf.derive(ikm)
     return [
-        int.from_bytes(output_bytes[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE],'big')*INV_POW64
+        int.from_bytes(output_bytes[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE],'big')*2**-64
         for i in range(blen)
     ]
 

@@ -1,7 +1,9 @@
+import os
 import math
 import time
 import random
 import cProfile, pstats
+from dotenv import load_dotenv
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -10,16 +12,13 @@ import torch
 import msgpack
 from tqdm import tqdm
 import torch.nn.functional as F
-from datasets import load_dataset
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-N_PROMPTS = 5
-MAX_NEW_TOKENS = 500
-MODEL_ID = "meta-llama/Llama-2-7b"
-DATASET_ID = "allenai/c4"
-DATASET_CONFIG = "en.noblocklist"
+N_PROMPTS = 1000
+MAX_NEW_TOKENS = 50
+MODEL_ID = "meta-llama/Llama-2-7b-hf"
 
 # --- Experiment Parameters (pending clarification) ---
 WM_PARAMS = {
@@ -35,18 +34,19 @@ NWM_PARAMS = {**WM_PARAMS, 'rLambda': float('inf')}
 PAYLOAD_LEN_DETECT = 0
 
 def setup():
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16, device_map="auto")
+    HF_TOKEN = os.getenv("HF")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID,token=HF_TOKEN,dtype=torch.float16, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    dataset = load_dataset(DATASET_ID, DATASET_CONFIG, split="train", streaming=True)
-    return model, tokenizer, dataset
+    return model, tokenizer
 
-model, tokenizer, dataset, bitLen = None, None, None, None
+model, tokenizer, bitLen = None, None, None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def getEntropy(probs: torch.Tensor) -> float: return -torch.sum(probs * torch.log(probs + 1e-9)).item()
-def getEmpiricalEntropy(probs: torch.Tensor, selIdx: int) -> float: return -torch.log(probs[selIdx] + 1e-9).item()
+def getEntropy(probs: torch.Tensor) -> float: return -torch.sum(probs * torch.log2(probs + 1e-9)).item()
+def getEmpiricalEntropy(probs: torch.Tensor, selIdx: int) -> float: return -torch.log2(probs[selIdx] + 1e-9).item()
 def getPDF(logits: torch.Tensor, t: float) -> torch.Tensor: return torch.softmax(logits/t, dim=-1)
 def getBinaryEntropy(p: float) -> float: return -(p * math.log2(p) + (1 - p) * math.log2(1 - p)) if 0<p<1 else 0.0
+def getBinaryEmpiricalEntropy(p: float, selIdx: int) -> float: return -math.log2(p+1e-9) if selIdx==1 else -math.log2(1-p+1e-9)
 
 def getP1(cs:torch.Tensor,prefix:int,bitIdx:int)->float:
     v=cs.shape[-1]-1
@@ -119,6 +119,7 @@ class Christ:
             self.log['encoder']['y'].append(Ys[bitIdx])
             self.log['encoder']['p1'].append(p1)
             self.log['encoder']['binaryEntropy'].append(getBinaryEntropy(p1 if newTokenId&1==1 else 1-p1))
+            self.log['encoder']['binaryEmpiricalEntropy'].append(getBinaryEmpiricalEntropy(p1,newTokenId&1))
 
             if self.inH: self.r.append(newTokenId&1)
             if self.isGeneral and self.h>=self.rLambda: # sometimes invalidate self.inH at bit boundary if isGeneral status, update Ys
@@ -165,7 +166,7 @@ class Christ:
         # Compute log-likelihood scores
         p = Ys.clamp(min=1e-9, max=1 - 1e-9)
         v = torch.where(B == 1, p, 1.0 - p)
-        scores = -torch.log(v)  # (nMessages, nOffsets, totalBits)
+        scores = -torch.log2(v)  # (nMessages, nOffsets, totalBits)
 
         # Mask out acausal prefix (only bits from offset onward count)
         # tri = torch.triu(torch.ones(totalBits, totalBits, device=device, dtype=torch.float64))
@@ -233,41 +234,29 @@ def generateSequence(model, tokenizer, prompt: str, algo, maxLen: int):
         lastToken = newToken.unsqueeze(0)
     return inputIds.squeeze(0)[initLen:].tolist()
 
-def main():
-    global model, tokenizer, dataset, bitLen
-    model, tokenizer, dataset = setup()
-    dataset = iter(dataset)
+def main(idxStart, idxEnd):
+    global model, tokenizer, bitLen
+    model, tokenizer = setup()
+    with open("prompts.txt", "r", encoding="utf-8") as f:
+        dataset=[line.strip() for line in f]
+    dataset=dataset[idxStart:idxEnd]
     bitLen = math.ceil(math.log2(len(tokenizer)))
     data = []
-    for i in tqdm(range(N_PROMPTS), desc="Processing Prompts"):
+    for i,prompt_text in tqdm(enumerate(dataset), desc="Processing Prompts"):
         t0 = time.time()
-        prompt_text = next(dataset)['text'][:256] # Truncate long prompts
-        pass
-
         wmEncoder = Christ(**WM_PARAMS)
         wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
-        pass
-        # print(wmEncoder.log['encoder']['y'][:20])
-        # print(len(wmEncoder.r))
-        # print(wmEncoder.r)
-        # pass
-        wmDecoder = Christ(**WM_PARAMS)
-        wmRes = wmDecoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
-        print(f"{time.time()-t0:.2f}s/prompt {wmRes}")
-        pass
-        # nwmEncoder = Christ(**NWM_PARAMS)
-        # nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
-        # nwmDecoder = Christ(**WM_PARAMS) # Detector uses WM key
-        # nwmRes = nwmDecoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)
+        tWM = time.time()-t0
+        
+        t0 = time.time()
+        nwmEncoder = Christ(**NWM_PARAMS)
+        nwmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
+        tNWM = time.time()-t0
+        
+        data.append({"idx": i, "isWM": True, "ids": wmIds, "t":tWM, "data": wmEncoder.log, "params": WM_PARAMS})
+        data.append({"idx": i, "isWM": False, "ids": nwmIds, "t":tNWM, "data": nwmEncoder.log, "params": NWM_PARAMS})
 
-        # data.append({'prompt_id':i,'encoder_log':wmEncoder.log,'decoder_log':wmDecoder.log,'is_wm':True,'detected':wmRes['detected']})
-        # data.append({'prompt_id':i,'encoder_log':nwmEncoder.log,'decoder_log':nwmDecoder.log,'is_wm':False,'detected':nwmRes['detected']})
-        pass
-
-    # torch.save(data, "experiment_results.pt")
+    torch.save(data, "experiment_results.pt")
 
 if __name__ == "__main__":
-    cProfile.run('main()', 'mBitmProcHKDF.prof')
-
-    stats = pstats.Stats('mBitmProcHKDF.prof')
-    stats.sort_stats(pstats.SortKey.CUMULATIVE).print_stats(20) # Print top 20 cumulative time functions
+    main(0,3)

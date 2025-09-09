@@ -249,6 +249,7 @@ def main(idxStart, idxEnd):
     bitLen = math.ceil(math.log2(len(tokenizer)))
     
     for i,prompt_text in tqdm(enumerate(dataset), desc="Processing Prompts"):
+        i+=idxStart
         t0 = time.time()
         wmEncoder = Christ(**WM_PARAMS)
         wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)

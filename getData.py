@@ -279,6 +279,7 @@ def main(idxStart, idxEnd):
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     import sys
-    a = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    b = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    a = int(sys.argv[1])
+    b = int(sys.argv[2])
+    print(f"Starting prompts#{a}-{b}")
     main(a,b)

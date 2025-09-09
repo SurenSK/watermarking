@@ -1,4 +1,5 @@
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import math
 import time
 import random
@@ -7,6 +8,8 @@ from dotenv import load_dotenv
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import multiprocessing as mp
+
 
 import torch
 import msgpack
@@ -274,4 +277,8 @@ def main(idxStart, idxEnd):
         
 
 if __name__ == "__main__":
-    main(0,3)
+    mp.set_start_method("spawn", force=True)
+    import sys
+    a = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    b = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    main(a,b)

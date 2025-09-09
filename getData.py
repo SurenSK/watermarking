@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 1000
-MAX_NEW_TOKENS = 200
+MAX_NEW_TOKENS = 500
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 
 # --- Experiment Parameters (pending clarification) ---

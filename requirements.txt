@@ -6,3 +6,4 @@ tqdm
 accelerate
 sentencepiece
 python-dotenv
+msgpack

@@ -35,7 +35,7 @@ PAYLOAD_LEN_DETECT = 0
 
 def setup():
     HF_TOKEN = os.getenv("HF")
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID,token=HF_TOKEN,dtype=torch.float16, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID,token=HF_TOKEN,torch_dtype=torch.float16, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     return model, tokenizer
 

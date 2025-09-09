@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 1000
-MAX_NEW_TOKENS = 500
+MAX_NEW_TOKENS = 200
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 
 # --- Experiment Parameters (pending clarification) ---
@@ -60,16 +60,17 @@ def getP1(cs:torch.Tensor,prefix:int,bitIdx:int)->float:
     return((s2-s1)/total).item()
 
 def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]:
-    L=blen*8
-    max_l=255*hashes.SHA256.digest_size
+    bytes_per = 3
+    L = blen * bytes_per
+    max_l = 255 * hashes.SHA256.digest_size
     if L > max_l:
         raise ValueError(f"Requested bytes {L} exceeds HKDF-SHA256 limit of {max_l}")
-    info=msgpack.packb(context, use_bin_type=True) if context else b""
-    hkdf=HKDF(algorithm=hashes.SHA256(),length=L,salt=salt,info=info)
-    output_bytes=hkdf.derive(ikm)
-    bytesPer=8
+    info = msgpack.packb(context, use_bin_type=True) if context else b""
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=L, salt=salt, info=info)
+    output_bytes = hkdf.derive(ikm)
+    max_int = (1 << (8 * bytes_per)) - 1
     return [
-        int.from_bytes(output_bytes[i*bytesPer:(i+1)*bytesPer],'big')/(2**64-1)
+        int.from_bytes(output_bytes[i*bytes_per:(i+1)*bytes_per], 'big') / max_int
         for i in range(blen)
     ]
 
@@ -255,6 +256,7 @@ def main(idxStart, idxEnd):
         t0 = time.time()
         wmRes = wmEncoder.decode(wmIds)
         tWMDecode = time.time()-t0
+        print(wmRes)
         data = {"idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, "ids": wmIds, "t":tWM, "data": wmEncoder.log, "decodeRes":wmRes, "params": WM_PARAMS}
         torch.save(data, f"results/experiment0_results_wm_{i}.pt")
         
@@ -265,6 +267,7 @@ def main(idxStart, idxEnd):
         t0 = time.time()
         nwmRes = nwmEncoder.decode(nwmIds)
         tNWMDecode = time.time()-t0
+        print(nwmRes)
         data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "t":tNWM, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}
         torch.save(data, f"results/experiment0_results_nwm_{i}.pt")
         

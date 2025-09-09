@@ -24,7 +24,7 @@ MODEL_ID = "meta-llama/Llama-2-7b-hf"
 WM_PARAMS = {
     'key': 40,
     'salt': 41,
-    'rLambda': 4.0,
+    'rLambda': 10.0,
     'random_seed': 42,
     't': 1.0,
     'payload': None,
@@ -168,7 +168,7 @@ class Christ:
         # Compute log-likelihood scores
         p = Ys.clamp(min=1e-9, max=1 - 1e-9)
         v = torch.where(B == 1, p, 1.0 - p)
-        scores = -torch.log2(v)  # (nMessages, nOffsets, totalBits)
+        scores = -torch.log(v)  # (nMessages, nOffsets, totalBits)
 
         # Mask out acausal prefix (only bits from offset onward count)
         # tri = torch.triu(torch.ones(totalBits, totalBits, device=device, dtype=torch.float64))
@@ -254,8 +254,8 @@ def main(idxStart, idxEnd):
         nwmEncoder = Christ(**NWM_PARAMS)
         nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
         tNWM = time.time()-t0
-        print(f"WM Detection: {wmEncoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)}")
-        print(f"NWM Detection: {wmEncoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)}")
+        print(f"WM Detection: {wmEncoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)} True N {len(wmEncoder.r)}")
+        print(f"NWM Detection: {wmEncoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)} True N {len(nwmEncoder.r)}")
         data.append({"idx": i, "isWM": True, "ids": wmIds, "t":tWM, "data": wmEncoder.log, "params": WM_PARAMS})
         # print(data[-1])
         data.append({"idx": i, "isWM": False, "ids": nwmIds, "t":tNWM, "data": nwmEncoder.log, "params": NWM_PARAMS})

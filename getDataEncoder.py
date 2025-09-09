@@ -86,6 +86,8 @@ def getYsBatched(
         cs = max(1, math.ceil(len(jobs) / (nw*32)))
         # Use the named helper function instead of a lambda
         return list(ex.map(_unpack_and_call_getYs, jobs, chunksize=cs))
+def nested_dd_list():
+    return defaultdict(list)
 
 class Christ:
     def __init__(self, key: int, salt: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = True):
@@ -103,7 +105,7 @@ class Christ:
         self.salt_bytes = salt.to_bytes(8, 'big', signed=True)
         self.seed_bytes = random_seed.to_bytes(8, 'big', signed=True)
 
-        self.log = defaultdict(lambda: defaultdict(list))
+        self.log = defaultdict(nested_dd_list)
 
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits / self.t, dim=-1)
@@ -250,13 +252,16 @@ def main(idxStart, idxEnd):
         
         t0 = time.time()
         nwmEncoder = Christ(**NWM_PARAMS)
-        nwmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
+        nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
         tNWM = time.time()-t0
-        
+        print(f"WM Detection: {wmEncoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)}")
+        print(f"NWM Detection: {wmEncoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)}")
         data.append({"idx": i, "isWM": True, "ids": wmIds, "t":tWM, "data": wmEncoder.log, "params": WM_PARAMS})
+        # print(data[-1])
         data.append({"idx": i, "isWM": False, "ids": nwmIds, "t":tNWM, "data": nwmEncoder.log, "params": NWM_PARAMS})
+        # print(data[-1])
 
-    torch.save(data, "experiment_results.pt")
+    torch.save(data, f"experiment_results_{idxStart}_{idxEnd}.pt")
 
 if __name__ == "__main__":
     main(0,3)

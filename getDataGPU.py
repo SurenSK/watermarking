@@ -9,7 +9,7 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import multiprocessing as mp
-
+from prf import getYs, getYsBatchedTorch
 
 import torch
 import msgpack
@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 1000
-MAX_NEW_TOKENS = 200
+MAX_NEW_TOKENS = 500
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 
 # --- Experiment Parameters (pending clarification) ---
@@ -30,7 +30,7 @@ WM_PARAMS = {
     'rLambda': 6.0,
     'random_seed': 42,
     't': 1.0,
-    'payload': None,
+    'payload': "011",
     'isGeneral': True
 }
 NWM_PARAMS = {**WM_PARAMS, 'rLambda': float('inf')}
@@ -62,34 +62,34 @@ def getP1(cs:torch.Tensor,prefix:int,bitIdx:int)->float:
     if(total:=s2-s0)<1e-9: return 0.0
     return((s2-s1)/total).item()
 
-def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]:
-    bytes_per = 3
-    L = blen * bytes_per
-    max_l = 255 * hashes.SHA256.digest_size
-    if L > max_l:
-        raise ValueError(f"Requested bytes {L} exceeds HKDF-SHA256 limit of {max_l}")
-    info = msgpack.packb(context, use_bin_type=True) if context else b""
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=L, salt=salt, info=info)
-    output_bytes = hkdf.derive(ikm)
-    max_int = (1 << (8 * bytes_per)) - 1
-    return [
-        int.from_bytes(output_bytes[i*bytes_per:(i+1)*bytes_per], 'big') / max_int
-        for i in range(blen)
-    ]
+# def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]:
+#     bytes_per = 3
+#     L = blen * bytes_per
+#     max_l = 255 * hashes.SHA256.digest_size
+#     if L > max_l:
+#         raise ValueError(f"Requested bytes {L} exceeds HKDF-SHA256 limit of {max_l}")
+#     info = msgpack.packb(context, use_bin_type=True) if context else b""
+#     hkdf = HKDF(algorithm=hashes.SHA256(), length=L, salt=salt, info=info)
+#     output_bytes = hkdf.derive(ikm)
+#     max_int = (1 << (8 * bytes_per)) - 1
+#     return [
+#         int.from_bytes(output_bytes[i*bytes_per:(i+1)*bytes_per], 'big') / max_int
+#         for i in range(blen)
+#     ]
 
-def _unpack_and_call_getYs(j_args):
-    """Unpacks arguments and calls getYs."""
-    return getYs(*j_args)
+# def _unpack_and_call_getYs(j_args):
+#     """Unpacks arguments and calls getYs."""
+#     return getYs(*j_args)
 
-def getYsBatched(
-    jobs: List[Tuple[bytes, bytes, List[Any], int]], 
-    max_workers: Optional[int] = None
-) -> List[List[float]]:
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        nw = ex._max_workers if ex._max_workers else 1
-        cs = max(1, math.ceil(len(jobs) / (nw*32)))
-        # Use the named helper function instead of a lambda
-        return list(ex.map(_unpack_and_call_getYs, jobs, chunksize=cs))
+# def getYsBatched(
+#     jobs: List[Tuple[bytes, bytes, List[Any], int]], 
+#     max_workers: Optional[int] = None
+# ) -> List[List[float]]:
+#     with ProcessPoolExecutor(max_workers=max_workers) as ex:
+#         nw = ex._max_workers if ex._max_workers else 1
+#         cs = max(1, math.ceil(len(jobs) / (nw*32)))
+#         # Use the named helper function instead of a lambda
+#         return list(ex.map(_unpack_and_call_getYs, jobs, chunksize=cs))
 def nested_dd_list():
     return defaultdict(list)
 
@@ -150,6 +150,7 @@ class Christ:
         payloads = list(range(nMessages))
         pass
         # Build all jobs: (salt, key, [payload, r_prefix, tkIdx], bitLen)
+        t0 = time.time()
         jobs = []
         for m_ in payloads:
             for offset in offsets:
@@ -158,14 +159,17 @@ class Christ:
                     jobs.append((self.salt_bytes, self.key_bytes, [m_, r_, tkIdx], bitLen))
 
         # Call PRF once for all jobs
-        t0 = time.time()
-        Ylist = getYsBatched(jobs)
-        Ys = (
-            torch.tensor(Ylist, dtype=torch.float64, device=device)
-            .reshape(nMessages, len(offsets), numTokens, bitLen)
-            .flatten(2, 3)  # -> (nMessages, nOffsets, totalBits)
-        )
+        # Ylist = getYsBatched(jobs)
+        # Ys = (
+        #     torch.tensor(Ylist, dtype=torch.float64, device=device)
+        #     .reshape(nMessages, len(offsets), numTokens, bitLen)
+        #     .flatten(2, 3)  # -> (nMessages, nOffsets, totalBits)
+        # )
+        Ys = getYsBatchedTorch(jobs, device=device)
+        Ys = Ys.reshape(nMessages, len(offsets), numTokens, bitLen).flatten(2, 3)
+
         pass
+        print(f"Batched Y - Processing {Ys.numel()} Ys {time.time()-t0:.2f}s")
         # Observed bitstream
         B = torch.tensor(fullBinary, dtype=torch.int64, device=device).view(1, 1, totalBits)
 
@@ -219,7 +223,7 @@ class Christ:
         detected = best_score > self.scoreThreshold
         message = format(best_message, f'0{payloadLen}b') if detected and payloadLen else ''
 
-        self.log['decoder']['y'] = Ys.detach().cpu()
+        # self.log['decoder']['y'] = Ys.detach().cpu()
         self.log['decoder']['scores'] = scores.detach().cpu()
         self.log['decoder']['normScores'] = norm_scores.detach().cpu()
 
@@ -258,10 +262,11 @@ def main(idxStart, idxEnd):
         wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
         tWM = time.time()-t0
         t0 = time.time()
-        wmRes = wmEncoder.decode(wmIds)
+        wmRes = wmEncoder.decode(wmIds, 3)
         tWMDecode = time.time()-t0
         print(wmRes)
         data = {"idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, "ids": wmIds, "t":tWM, "data": wmEncoder.log, "decodeRes":wmRes, "params": WM_PARAMS}
+        pass
         torch.save(data, f"results/experiment0_results_wm_{i}.pt")
         
         t0 = time.time()
@@ -269,7 +274,7 @@ def main(idxStart, idxEnd):
         nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
         tNWM = time.time()-t0
         t0 = time.time()
-        nwmRes = nwmEncoder.decode(nwmIds)
+        nwmRes = nwmEncoder.decode(nwmIds, 3)
         tNWMDecode = time.time()-t0
         print(nwmRes)
         data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "t":tNWM, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}

@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 N_PROMPTS = 1000
-MAX_NEW_TOKENS = 200
+MAX_NEW_TOKENS = 500
 MODEL_ID = "meta-llama/Llama-2-7b-hf"
 
 # --- Experiment Parameters (pending clarification) ---
@@ -253,34 +253,43 @@ def main(idxStart, idxEnd):
     
     for i,prompt_text in tqdm(enumerate(dataset), desc="Processing Prompts"):
         i+=idxStart
-        t0 = time.time()
-        wmEncoder = Christ(**WM_PARAMS)
-        wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
-        tWM = time.time()-t0
-        t0 = time.time()
-        wmRes = wmEncoder.decode(wmIds)
-        tWMDecode = time.time()-t0
-        print(wmRes)
-        data = {"idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, "ids": wmIds, "t":tWM, "data": wmEncoder.log, "decodeRes":wmRes, "params": WM_PARAMS}
-        torch.save(data, f"results/experiment0_results_wm_{i}.pt")
+        fp = f"results/experiment0_results_wm_{i}.pt"
+        if not os.path.exists(fp):
+            t0 = time.time()
+            wmEncoder = Christ(**WM_PARAMS)
+            wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
+            tWM = time.time()-t0
+            t0 = time.time()
+            wmRes = wmEncoder.decode(wmIds)
+            tWMDecode = time.time()-t0
+            print(wmRes)
+            data = {"idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, "ids": wmIds, "data": wmEncoder.log, "decodeRes":wmRes, "params": WM_PARAMS}
+            pass
+            torch.save(data, fp)
+        else:
+            print(f"idx {i} wm exists")
         
-        t0 = time.time()
-        nwmEncoder = Christ(**NWM_PARAMS)
-        nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
-        tNWM = time.time()-t0
-        t0 = time.time()
-        nwmRes = nwmEncoder.decode(nwmIds)
-        tNWMDecode = time.time()-t0
-        print(nwmRes)
-        data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "t":tNWM, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}
-        torch.save(data, f"results/experiment0_results_nwm_{i}.pt")
+        fp = f"results/experiment0_results_nwm_{i}.pt"
+        if not os.path.exists(fp):
+            t0 = time.time()
+            nwmEncoder = Christ(**NWM_PARAMS)
+            nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
+            tNWM = time.time()-t0
+            t0 = time.time()
+            nwmRes = nwmEncoder.decode(nwmIds)
+            tNWMDecode = time.time()-t0
+            print(nwmRes)
+            data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}
+            torch.save(data, f"results/experiment0_results_nwm_{i}.pt")
+        else:
+            print(f"idx {i} nwm exists")
         
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
-    # import sys
-    # a = int(sys.argv[1])
-    # b = int(sys.argv[2])
-    # print(f"Starting prompts#{a}-{b}")
-    a = 0
-    b = 3
+    import sys
+    a = int(sys.argv[1])
+    b = int(sys.argv[2])
+    # a = 0
+    # b = 3
+    print(f"Starting prompts#{a}-{b}")
     main(a,b)

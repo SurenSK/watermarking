@@ -10,9 +10,9 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import multiprocessing as mp
 
-
 import torch
 import msgpack
+import numpy as np
 from tqdm import tqdm
 import torch.nn.functional as F
 from cryptography.hazmat.primitives import hashes
@@ -43,6 +43,11 @@ def setup():
     return model, tokenizer
 
 model, tokenizer, bitLen = None, None, None
+rng = torch.Generator(device=torch.device("cpu"))
+rng.manual_seed(2971215073)  # fib47 is prime
+table_size = 1_000_003
+fixed_table = torch.rand(table_size, generator=rng, dtype=torch.float32, device=rng.device)
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def getEntropy(probs: torch.Tensor) -> float: return -torch.sum(probs * torch.log2(probs + 1e-9)).item()
@@ -63,33 +68,10 @@ def getP1(cs:torch.Tensor,prefix:int,bitIdx:int)->float:
     return((s2-s1)/total).item()
 
 def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]:
-    bytes_per = 3
-    L = blen * bytes_per
-    max_l = 255 * hashes.SHA256.digest_size
-    if L > max_l:
-        raise ValueError(f"Requested bytes {L} exceeds HKDF-SHA256 limit of {max_l}")
-    info = msgpack.packb(context, use_bin_type=True) if context else b""
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=L, salt=salt, info=info)
-    output_bytes = hkdf.derive(ikm)
-    max_int = (1 << (8 * bytes_per)) - 1
-    return [
-        int.from_bytes(output_bytes[i*bytes_per:(i+1)*bytes_per], 'big') / max_int
-        for i in range(blen)
-    ]
+    c = sum(sum(i) if isinstance(i, list) else i for i in context) if context else 0
+    base = int.from_bytes(salt, 'big') * int.from_bytes(ikm, 'big') * (c)
+    return [fixed_table[(base + i) % 1_000_003] for i in range(blen)]
 
-def _unpack_and_call_getYs(j_args):
-    """Unpacks arguments and calls getYs."""
-    return getYs(*j_args)
-
-def getYsBatched(
-    jobs: List[Tuple[bytes, bytes, List[Any], int]], 
-    max_workers: Optional[int] = None
-) -> List[List[float]]:
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        nw = ex._max_workers if ex._max_workers else 1
-        cs = max(1, math.ceil(len(jobs) / (nw*32)))
-        # Use the named helper function instead of a lambda
-        return list(ex.map(_unpack_and_call_getYs, jobs, chunksize=cs))
 def nested_dd_list():
     return defaultdict(list)
 
@@ -141,76 +123,42 @@ class Christ:
 
     def decode(self, tokenIds: List[int], payloadLen: Optional[int] = 0) -> Dict:
         fullBinary = [int(b) for t in tokenIds for b in format(t, f'0{bitLen}b')]
-        totalBits = len(fullBinary)
-        numTokens = len(tokenIds)
+        totalBits, numTokens = len(fullBinary), len(tokenIds)
         offsets = list(range(0, totalBits + 1, 1 if self.isGeneral else bitLen))
-
-        # Payload hypotheses
         nMessages = 2**payloadLen
-        payloads = list(range(nMessages))
-        pass
-        # Build all jobs: (salt, key, [payload, r_prefix, tkIdx], bitLen)
-        jobs = []
-        for m_ in payloads:
-            for offset in offsets:
-                r_ = fullBinary[:offset]
-                for tkIdx in range(numTokens):
-                    jobs.append((self.salt_bytes, self.key_bytes, [m_, r_, tkIdx], bitLen))
 
-        # Call PRF once for all jobs
-        t0 = time.time()
-        Ylist = getYsBatched(jobs)
-        Ys = (
-            torch.tensor(Ylist, dtype=torch.float64, device=device)
-            .reshape(nMessages, len(offsets), numTokens, bitLen)
-            .flatten(2, 3)  # -> (nMessages, nOffsets, totalBits)
-        )
-        pass
-        # Observed bitstream
-        B = torch.tensor(fullBinary, dtype=torch.int64, device=device).view(1, 1, totalBits)
-
-        # Compute log-likelihood scores
+        B_t = torch.tensor(fullBinary, device=device, dtype=torch.int32)
+        B_cumsum = F.pad(B_t.cumsum(0), (1, 0))
+        offsets_t = torch.tensor(offsets, device=device, dtype=torch.int32)
+        m_t = torch.arange(nMessages, device=device, dtype=torch.int32).view(nMessages, 1, 1)
+        r_sums_t = B_cumsum[offsets_t].view(1, len(offsets), 1)
+        tkIdx_t = torch.arange(numTokens, device=device, dtype=torch.int32).view(1, 1, numTokens)
+        c_t = m_t + r_sums_t + tkIdx_t
+        
+        base_multiplier = int.from_bytes(self.salt_bytes, 'big') * int.from_bytes(self.key_bytes, 'big')
+        base_t = (base_multiplier * c_t).unsqueeze(-1)
+        bit_range_t = torch.arange(bitLen, device=device, dtype=torch.int32).view(1, 1, 1, bitLen)
+        indices_t = (base_t + bit_range_t) % table_size
+        
+        Ys = fixed_table.to(device)[indices_t].flatten(2, 3).to(torch.float32)
+        
+        B = B_t.view(1, 1, totalBits)
         p = Ys.clamp(min=1e-9, max=1 - 1e-9)
         v = torch.where(B == 1, p, 1.0 - p)
-        scores = -torch.log(v)  # (nMessages, nOffsets, totalBits)
-
-        # Mask out acausal prefix (only bits from offset onward count)
-        # tri = torch.triu(torch.ones(totalBits, totalBits, device=device, dtype=torch.float64))
-        # mask = tri.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
-        # # MS[m, o_idx, k] = score for hypo (m, offsets[o_idx]) starting at bit k
-        # masked_scores = (scores.unsqueeze(-2) * mask).sum(dim=-1) # (M, nOffsets, T)
-        # Efficiently compute the suffix sum: masked_scores[m, o, k] = SUM_{j=k}^{T-1} scores[m, o, j]
-        # This avoids materializing the O(T^3) intermediate tensor.
+        scores = -torch.log(v)
         masked_scores = torch.cumsum(scores.flip(dims=[-1]), dim=-1).flip(dims=[-1])
         offset_vals_t = torch.tensor(offsets, device=device)
 
         if self.isGeneral:
-            # Efficiently extract the diagonal for the isGeneral=True case
-            # This works because offsets[o_idx] == o_idx
             total_nll = torch.diagonal(masked_scores, dim1=-2, dim2=-1)
-            
-            # Pad for the final offset (offset=T, L=0, score=0)
-            zero_pad = torch.zeros((nMessages, 1), device=device, dtype=torch.float64)
-            total_nll = torch.cat([total_nll, zero_pad], dim=1) # Shape (M, nOffsets)
+            total_nll = F.pad(total_nll, (0, 1))
         else:
-            # For isGeneral=False, offsets are sparse. We must use advanced indexing.
-            # We need to extract masked_scores[m, o_idx, offsets[o_idx]] for each hypothesis.
             msg_indices = torch.arange(nMessages, device=device).view(-1, 1)
             offset_indices = torch.arange(len(offsets), device=device).view(1, -1)
-            
-            # offset_vals_t contains the actual bit positions [0, 15, 30, ...]
-            bit_start_indices = offset_vals_t.view(1, -1)
+            total_nll = masked_scores[msg_indices, offset_indices, offset_vals_t.view(1, -1)]
 
-            total_nll = masked_scores[msg_indices, offset_indices, bit_start_indices]
-
-        # Effective watermark length L for EACH offset hypothesis
-        wm_len = (totalBits - offset_vals_t).unsqueeze(0).float() # Shape (1, nOffsets)
-
-        # Normalize: (Score - L) / sqrt(L). Add epsilon to avoid div by zero for L=0.
+        wm_len = (totalBits - offset_vals_t).unsqueeze(0).float()
         norm_scores = (total_nll - wm_len) / (wm_len + 1e-9).sqrt()
-        # The L=0 case (last offset) results in 0/eps = 0, which is correct.
-
-        # Best hypothesis
         max_val, max_idx = torch.max(norm_scores.view(-1), dim=0)
         best_message = (max_idx // len(offsets)).item()
         best_offset = offsets[(max_idx % len(offsets)).item()]
@@ -244,6 +192,7 @@ def main(idxStart, idxEnd):
     results_dir = "results"
     os.makedirs(results_dir, exist_ok=True)
     global model, tokenizer, bitLen
+
     model, tokenizer = setup()
     print(f"Running at Lambda={WM_PARAMS['rLambda']:.2f}")
     with open("prompts.txt", "r", encoding="utf-8") as f:
@@ -253,37 +202,57 @@ def main(idxStart, idxEnd):
     
     for i,prompt_text in tqdm(enumerate(dataset), desc="Processing Prompts"):
         i+=idxStart
-        fp = f"results/experiment0_results_wm_{i}.pt"
+        fp = f"results/experiment0_results_wm_{i}.npz"
         if not os.path.exists(fp):
             t0 = time.time()
             wmEncoder = Christ(**WM_PARAMS)
             wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
             tWM = time.time()-t0
             t0 = time.time()
-            wmRes = wmEncoder.decode(wmIds)
+            wmRes = wmEncoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
             tWMDecode = time.time()-t0
-            print(wmRes)
-            data = {"idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, "ids": wmIds, "data": wmEncoder.log, "decodeRes":wmRes, "params": WM_PARAMS}
-            pass
-            torch.save(data, fp)
+            
+            log_to_save = {}
+            for key, tensor in wmEncoder.log['decoder'].items():
+                log_to_save[f'decoder_{key}'] = tensor.to(torch.float32).numpy()
+            for key, lst in wmEncoder.log['encoder'].items():
+                log_to_save[f'encoder_{key}'] = np.array(lst, dtype=object if key == 'r' else np.float32)
+
+            data = {
+                "idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, 
+                "ids": np.array(wmIds, dtype=np.int32), "params": str(WM_PARAMS),
+                **wmRes, **log_to_save
+            }
+            print({'tEncode': data['tEncode'], 'tDecode': data['tDecode'], 'detected': data['detected'], 'score': data['score']})
+            np.savez_compressed(fp, **data)
         else:
             print(f"idx {i} wm exists")
         
-        fp = f"results/experiment0_results_nwm_{i}.pt"
+        fp = f"results/experiment0_results_nwm_{i}.npz"
         if not os.path.exists(fp):
             t0 = time.time()
             nwmEncoder = Christ(**NWM_PARAMS)
             nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
             tNWM = time.time()-t0
             t0 = time.time()
-            nwmRes = nwmEncoder.decode(nwmIds)
+            nwmRes = nwmEncoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)
             tNWMDecode = time.time()-t0
-            print(nwmRes)
-            data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}
-            torch.save(data, f"results/experiment0_results_nwm_{i}.pt")
+            
+            log_to_save = {}
+            for key, tensor in nwmEncoder.log['decoder'].items():
+                log_to_save[f'decoder_{key}'] = tensor.to(torch.float32).numpy()
+            for key, lst in nwmEncoder.log['encoder'].items():
+                log_to_save[f'encoder_{key}'] = np.array(lst, dtype=object if key == 'r' else np.float32)
+
+            data = {
+                "idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, 
+                "ids": np.array(nwmIds, dtype=np.int32), "params": str(NWM_PARAMS),
+                **nwmRes, **log_to_save
+            }
+            print({'tEncode': data['tEncode'], 'tDecode': data['tDecode'], 'detected': data['detected'], 'score': data['score']})
+            np.savez_compressed(fp, **data)
         else:
-            print(f"idx {i} nwm exists")
-        
+            print(f"idx {i} nwm exists")        
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     import sys

@@ -10,7 +10,6 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import multiprocessing as mp
 
-
 import torch
 import msgpack
 from tqdm import tqdm
@@ -27,14 +26,14 @@ MODEL_ID = "meta-llama/Llama-2-7b-hf"
 WM_PARAMS = {
     'key': 40,
     'salt': 41,
-    'rLambda': 6.0,
+    'rLambda': 4.0,
     'random_seed': 42,
     't': 1.0,
-    'payload': None,
+    'payload': "1",
     'isGeneral': True
 }
 NWM_PARAMS = {**WM_PARAMS, 'rLambda': float('inf')}
-PAYLOAD_LEN_DETECT = 0
+PAYLOAD_LEN_DETECT = 1
 
 def setup():
     HF_TOKEN = os.getenv("HF")
@@ -92,6 +91,8 @@ def getYsBatched(
         return list(ex.map(_unpack_and_call_getYs, jobs, chunksize=cs))
 def nested_dd_list():
     return defaultdict(list)
+
+counter=defaultdict(int)
 
 class Christ:
     def __init__(self, key: int, salt: int, rLambda: float, random_seed: int, t: float = 1.0, payload: Optional[str] = None, scoreThreshold: Optional[float] = None, isGeneral: bool = True):
@@ -243,7 +244,7 @@ def generateSequence(model, tokenizer, prompt: str, algo, maxLen: int):
 def main(idxStart, idxEnd):
     results_dir = "results"
     os.makedirs(results_dir, exist_ok=True)
-    global model, tokenizer, bitLen
+    global model, tokenizer, bitLen, counter
     model, tokenizer = setup()
     print(f"Running at Lambda={WM_PARAMS['rLambda']:.2f}")
     with open("prompts.txt", "r", encoding="utf-8") as f:
@@ -260,30 +261,33 @@ def main(idxStart, idxEnd):
             wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
             tWM = time.time()-t0
             t0 = time.time()
-            wmRes = wmEncoder.decode(wmIds)
+            wmRes = wmEncoder.decode(wmIds, PAYLOAD_LEN_DETECT)
             tWMDecode = time.time()-t0
             print(wmRes)
             data = {"idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, "ids": wmIds, "data": wmEncoder.log, "decodeRes":wmRes, "params": WM_PARAMS}
             pass
-            torch.save(data, fp)
+            counter[wmRes['message']]+=1
+            # torch.save(data, fp)
+            print(counter)
         else:
             print(f"idx {i} wm exists")
         
-        fp = f"results/experiment0_results_nwm_{i}.pt"
-        if not os.path.exists(fp):
-            t0 = time.time()
-            nwmEncoder = Christ(**NWM_PARAMS)
-            nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
-            tNWM = time.time()-t0
-            t0 = time.time()
-            nwmRes = nwmEncoder.decode(nwmIds)
-            tNWMDecode = time.time()-t0
-            print(nwmRes)
-            data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}
-            torch.save(data, f"results/experiment0_results_nwm_{i}.pt")
-        else:
-            print(f"idx {i} nwm exists")
-        
+        # fp = f"results/experiment0_results_nwm_{i}.pt"
+        # if not os.path.exists(fp):
+        #     t0 = time.time()
+        #     nwmEncoder = Christ(**NWM_PARAMS)
+        #     nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
+        #     tNWM = time.time()-t0
+        #     t0 = time.time()
+        #     nwmRes = nwmEncoder.decode(nwmIds)
+        #     tNWMDecode = time.time()-t0
+        #     print(nwmRes)
+        #     data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}
+        #     torch.save(data, f"results/experiment0_results_nwm_{i}.pt")
+        # else:
+        #     print(f"idx {i} nwm exists")
+    print('final')
+    print(counter)
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     import sys
@@ -292,6 +296,6 @@ if __name__ == "__main__":
         b = int(sys.argv[2])
     else:
         a = 0
-        b = 3
+        b = 100
     print(f"Starting prompts#{a}-{b}")
     main(a,b)

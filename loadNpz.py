@@ -4,7 +4,7 @@ from pathlib import Path
 results_dir = Path("results")
 
 # Find all .npz files from the experiment
-for p in sorted(results_dir.glob("experiment0_results_*.npz")):
+for p in sorted(results_dir.glob("experiment0_1bit_results_*.npz")):
     # allow_pickle=True is required to load the 'encoder_r' array
     data = np.load(p, allow_pickle=True)
     

@@ -30,11 +30,11 @@ WM_PARAMS = {
     'rLambda': 6.0,
     'random_seed': 42,
     't': 1.0,
-    'payload': "011",
+    'payload': "11",
     'isGeneral': True
 }
 NWM_PARAMS = {**WM_PARAMS, 'rLambda': float('inf')}
-PAYLOAD_LEN_DETECT = 0
+PAYLOAD_LEN_DETECT = 2
 
 def setup():
     HF_TOKEN = os.getenv("HF")
@@ -243,11 +243,13 @@ def generateSequence(model, tokenizer, prompt: str, algo, maxLen: int):
         inputIds = torch.cat([inputIds, newToken.unsqueeze(0)], dim=1)
         lastToken = newToken.unsqueeze(0)
     return inputIds.squeeze(0)[initLen:].tolist()
-
+import numpy as np
+count = defaultdict(int)
 def main(idxStart, idxEnd):
     results_dir = "results"
     os.makedirs(results_dir, exist_ok=True)
-    global model, tokenizer, bitLen
+    global model, tokenizer, bitLen, count
+
     model, tokenizer = setup()
     print(f"Running at Lambda={WM_PARAMS['rLambda']:.2f}")
     with open("prompts.txt", "r", encoding="utf-8") as f:
@@ -257,35 +259,67 @@ def main(idxStart, idxEnd):
     
     for i,prompt_text in tqdm(enumerate(dataset), desc="Processing Prompts"):
         i+=idxStart
-        t0 = time.time()
-        wmEncoder = Christ(**WM_PARAMS)
-        wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
-        tWM = time.time()-t0
-        t0 = time.time()
-        wmRes = wmEncoder.decode(wmIds, 3)
-        tWMDecode = time.time()-t0
-        print(wmRes)
-        data = {"idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, "ids": wmIds, "t":tWM, "data": wmEncoder.log, "decodeRes":wmRes, "params": WM_PARAMS}
-        pass
-        torch.save(data, f"results/experiment0_results_wm_{i}.pt")
+        fp = f"results/experiment0_results_wm_{i}.npz"
+        if not os.path.exists(fp):
+            t0 = time.time()
+            wmEncoder = Christ(**WM_PARAMS)
+            wmIds = generateSequence(model, tokenizer, prompt_text, wmEncoder, maxLen=MAX_NEW_TOKENS)
+            tWM = time.time()-t0
+            t0 = time.time()
+            wmRes = wmEncoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
+            tWMDecode = time.time()-t0
+            
+            log_to_save = {}
+            for key, tensor in wmEncoder.log['decoder'].items():
+                log_to_save[f'decoder_{key}'] = tensor.to(torch.float32).numpy()
+            for key, lst in wmEncoder.log['encoder'].items():
+                log_to_save[f'encoder_{key}'] = np.array(lst, dtype=object if key == 'r' else np.float32)
+
+            data = {
+                "idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, 
+                "ids": np.array(wmIds, dtype=np.int32), "params": str(WM_PARAMS),
+                **wmRes, **log_to_save
+            }
+            count[wmRes['message']]+=1
+            print(count)
+            print({'tEncode': data['tEncode'], 'tDecode': data['tDecode'], 'detected': data['detected'], 'score': data['score']})
+            np.savez_compressed(fp, **data)
+        else:
+            print(f"idx {i} wm exists")
         
-        t0 = time.time()
-        nwmEncoder = Christ(**NWM_PARAMS)
-        nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
-        tNWM = time.time()-t0
-        t0 = time.time()
-        nwmRes = nwmEncoder.decode(nwmIds, 3)
-        tNWMDecode = time.time()-t0
-        print(nwmRes)
-        data = {"idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, "ids": nwmIds, "t":tNWM, "data": nwmEncoder.log, "decodeRes":nwmRes, "params": NWM_PARAMS}
-        torch.save(data, f"results/experiment0_results_nwm_{i}.pt")
-        
+        # fp = f"results/experiment0_results_nwm_{i}.npz"
+        # if not os.path.exists(fp):
+        #     t0 = time.time()
+        #     nwmEncoder = Christ(**NWM_PARAMS)
+        #     nwmIds = generateSequence(model, tokenizer, prompt_text, nwmEncoder, maxLen=MAX_NEW_TOKENS)
+        #     tNWM = time.time()-t0
+        #     t0 = time.time()
+        #     nwmRes = nwmEncoder.decode(nwmIds, payloadLen=PAYLOAD_LEN_DETECT)
+        #     tNWMDecode = time.time()-t0
+            
+        #     log_to_save = {}
+        #     for key, tensor in nwmEncoder.log['decoder'].items():
+        #         log_to_save[f'decoder_{key}'] = tensor.to(torch.float32).numpy()
+        #     for key, lst in nwmEncoder.log['encoder'].items():
+        #         log_to_save[f'encoder_{key}'] = np.array(lst, dtype=object if key == 'r' else np.float32)
+
+        #     data = {
+        #         "idx": i, "tEncode": tNWM, "tDecode": tNWMDecode, "isWM": False, 
+        #         "ids": np.array(nwmIds, dtype=np.int32), "params": str(NWM_PARAMS),
+        #         **nwmRes, **log_to_save
+        #     }
+        #     print({'tEncode': data['tEncode'], 'tDecode': data['tDecode'], 'detected': data['detected'], 'score': data['score']})
+        #     np.savez_compressed(fp, **data)
+        # else:
+        #     print(f"idx {i} nwm exists")
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
-    # import sys
-    # a = int(sys.argv[1])
-    # b = int(sys.argv[2])
-    # print(f"Starting prompts#{a}-{b}")
-    a = 0
-    b = 3
+    import sys
+    if len(sys.argv)>1:
+        a = int(sys.argv[1])
+        b = int(sys.argv[2])
+    else:
+        a = 0
+        b = 100
+    print(f"Starting prompts#{a}-{b}")
     main(a,b)

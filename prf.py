@@ -176,7 +176,8 @@ def getYs(salt: bytes, ikm: bytes, context: List[Any], blen: int) -> List[float]
     else:
         payload_int, r_prefix, tkIdx = context
         payload = np.array([int(payload_int)], dtype=np.uint64)
-        offset = np.array([int(len(r_prefix))], dtype=np.uint64)
+        # offset = np.array([int(len(r_prefix))], dtype=np.uint64)
+        offset = np.array([len(r_prefix)], dtype=np.uint64)
         tkidx = np.array([int(tkIdx)], dtype=np.uint64)
     y = _prf_batched_dev(key32_dev, payload, offset, tkidx, blen, device='cuda')
     return y[0].tolist()

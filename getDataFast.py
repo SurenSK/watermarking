@@ -261,21 +261,21 @@ def main(idxStart, idxEnd):
             wmRes = wmEncoder.decode(wmIds, payloadLen=PAYLOAD_LEN_DETECT)
             tWMDecode = time.time()-t0
             
-            # log_to_save = {}
-            # for key, tensor in wmEncoder.log['decoder'].items():
-            #     log_to_save[f'decoder_{key}'] = tensor.to(torch.float32).numpy()
-            # for key, lst in wmEncoder.log['encoder'].items():
-            #     log_to_save[f'encoder_{key}'] = np.array(lst, dtype=object if key == 'r' else np.float32)
+            log_to_save = {}
+            for key, tensor in wmEncoder.log['decoder'].items():
+                log_to_save[f'decoder_{key}'] = tensor.to(torch.float32).numpy()
+            for key, lst in wmEncoder.log['encoder'].items():
+                log_to_save[f'encoder_{key}'] = np.array(lst, dtype=object if key == 'r' else np.float32)
 
-            # data = {
-            #     "idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, 
-            #     "ids": np.array(wmIds, dtype=np.int32), "params": str(WM_PARAMS),
-            #     **wmRes, **log_to_save
-            # }
+            data = {
+                "idx": i, "tEncode": tWM, "tDecode": tWMDecode, "isWM": True, 
+                "ids": np.array(wmIds, dtype=np.int32), "params": str(WM_PARAMS),
+                **wmRes, **log_to_save
+            }
             count[wmRes['message']]+=1
             print(count)
-            # print({'tEncode': data['tEncode'], 'tDecode': data['tDecode'], 'detected': data['detected'], 'score': data['score']})
-            # np.savez_compressed(fp, **data)
+            print({'tEncode': data['tEncode'], 'tDecode': data['tDecode'], 'detected': data['detected'], 'score': data['score']})
+            np.savez_compressed(fp, **data)
         else:
             print(f"idx {i} wm exists")
         
